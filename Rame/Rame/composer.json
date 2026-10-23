@@ -1,0 +1,12 @@
+{
+    "name": "rame/gestion-ti",
+    "description": "Plataforma interna para activos y mantenimiento de TI",
+    "type": "project",
+    "require": {
+        "php": ">=8.1",
+        "phpmailer/phpmailer": "^6.9"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

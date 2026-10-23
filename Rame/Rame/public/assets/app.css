@@ -140,6 +140,8 @@ a { color: inherit; }
 .data-table th { padding: 11px 16px; color: #657b97; background: #f2f6fc; text-align: left; font: 500 9px 'DM Mono', monospace; text-transform: uppercase; white-space: nowrap; }
 .data-table td { padding: 13px 16px; border-top: 1px solid #e8eef6; font-size: 11px; vertical-align: middle; }
 .data-table tbody tr:hover { background: #f7faff; }
+.data-table tbody tr.has-responsibility-letter > td,
+.data-table tbody tr.has-responsibility-letter:hover > td { background-color: #eaf5ec; }
 .table-primary { display: block; font-weight: 700; }
 .table-secondary { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; }
 .mono { font: 10px 'DM Mono', monospace; }

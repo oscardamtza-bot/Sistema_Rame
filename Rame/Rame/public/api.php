@@ -144,8 +144,8 @@ try {
 
     if ($action === 'assets' && $method === 'GET') {
         $statement = $user['role'] === 'user'
-            ? db()->prepare('SELECT a.*, u.name AS assigned_name, EXISTS (SELECT 1 FROM responsibility_documents d WHERE d.asset_id=a.id AND d.form_type="responsibility") AS has_responsibility_letter FROM assets a LEFT JOIN users u ON u.id=a.assigned_user_id WHERE a.assigned_user_id=? ORDER BY a.created_at DESC')
-            : db()->query('SELECT a.*, u.name AS assigned_name, EXISTS (SELECT 1 FROM responsibility_documents d WHERE d.asset_id=a.id AND d.form_type="responsibility") AS has_responsibility_letter FROM assets a LEFT JOIN users u ON u.id=a.assigned_user_id ORDER BY a.created_at DESC');
+            ? db()->prepare('SELECT a.*, u.name AS assigned_name, EXISTS (SELECT 1 FROM responsibility_documents d WHERE d.asset_id=a.id AND d.user_id=a.assigned_user_id AND d.form_type="responsibility" AND d.signed_at IS NOT NULL) AS has_responsibility_letter FROM assets a LEFT JOIN users u ON u.id=a.assigned_user_id WHERE a.assigned_user_id=? ORDER BY a.created_at DESC')
+            : db()->query('SELECT a.*, u.name AS assigned_name, EXISTS (SELECT 1 FROM responsibility_documents d WHERE d.asset_id=a.id AND d.user_id=a.assigned_user_id AND d.form_type="responsibility" AND d.signed_at IS NOT NULL) AS has_responsibility_letter FROM assets a LEFT JOIN users u ON u.id=a.assigned_user_id ORDER BY a.created_at DESC');
         if ($user['role'] === 'user') {
             $statement->execute([$user['id']]);
         }

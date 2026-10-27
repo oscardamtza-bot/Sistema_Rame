@@ -1,6 +1,6 @@
 # Rame TI
 
-Plataforma interna para inventario de computadoras y celulares, usuarios, licencias, credenciales, cartas responsivas y mantenimientos preventivos.
+Plataforma interna para inventario de computadoras, usuarios, licencias, credenciales, cartas responsivas y mantenimientos preventivos.
 
 ## Requisitos
 
@@ -24,14 +24,14 @@ Plataforma interna para inventario de computadoras y celulares, usuarios, licenc
 5. Ajusta host, usuario y contraseña MySQL en el mismo archivo si tu instalación no usa `root` sin contraseña.
 6. Desde la carpeta del proyecto instala PHPMailer ejecutando `composer install`.
 7. Completa los valores SMTP (`host`, `port`, `username`, `password`, `from_email`, `encryption`) en `app/config.local.php`. Sin SMTP configurado, el sistema agenda el mantenimiento, avisa que el correo no se envió y permite copiar un enlace seguro para compartirlo manualmente.
-8. Abre `http://localhost/Rame/` y crea la primera cuenta administradora. Usa una contraseña de al menos 12 caracteres.
+8. Abre `http://localhost/Rame/` y crea la primera cuenta administradora. Usa una contraseña de al menos 8 caracteres.
 9. Desde **Usuarios**, agrega cuentas de técnicos y usuarios finales. Registra los activos antes de asignarlos, y luego crea licencias, mantenimientos y cartas responsivas.
 
 ## Funciones incluidas
 
 - Panel de operación con activos y próximos mantenimientos.
 - Gráficas del inventario por estado y tipo, licencias por vigencia y tendencia mensual de mantenimientos.
-- Inventario de equipos, usuarios con roles, licencias y control de activaciones.
+- Inventario de equipos, usuarios con roles, licencias y control de activaciones; filtro de personas sin carta responsiva firmada.
 - Estado del celular: **Activo**, **Formateado** o **Por formatear**, separado de su estado general de inventario.
 - Inventario separado entre equipos de cómputo y celulares administrativos/operacionales, con historial cronológico de fallas, piezas y reparaciones por equipo.
 - Bóveda de credenciales cifradas con AES-256-GCM; solo administración puede revelarlas.

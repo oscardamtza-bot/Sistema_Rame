@@ -130,3 +130,10 @@ function clean_string(mixed $value, int $maxLength = 255): string
     $value = trim((string) $value);
     return function_exists('mb_substr') ? mb_substr($value, 0, $maxLength) : substr($value, 0, $maxLength);
 }
+
+function clean_text(mixed $value, int $maxLength = 255): string
+{
+    $value = trim((string) $value);
+    $value = function_exists('mb_strtoupper') ? mb_strtoupper($value, 'UTF-8') : strtoupper($value);
+    return clean_string($value, $maxLength);
+}

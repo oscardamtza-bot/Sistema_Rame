@@ -1,4 +1,5 @@
 /app/config.local.php
+/app/uploads/
 /vendor/
 /.env
 /.idea/

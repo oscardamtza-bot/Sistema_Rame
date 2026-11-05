@@ -12,7 +12,7 @@ return [
     'timezone' => 'America/Mexico_City',
     'encryption_key' => 'PEGA_AQUI_LA_CLAVE_BASE64_DE_32_BYTES',
     'smtp' => [
-        'host' => '',
+        'host' => 'smtp.gmail.com',
         'port' => 587,
         'username' => '',
         'password' => '',

@@ -1,5 +1,9 @@
 /app/config.local.php
+/app/uploads/
 /vendor/
 /.env
 /.idea/
 /.vscode/
+/acomodo.xlsx
+/backups_*/
+/dist/

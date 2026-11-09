@@ -4,3 +4,6 @@
 /.env
 /.idea/
 /.vscode/
+/acomodo.xlsx
+/backups_*/
+/dist/

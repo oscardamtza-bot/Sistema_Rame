@@ -39,7 +39,13 @@ Plataforma interna para inventario de PC y laptops, usuarios, credenciales, cart
 - Inventario separado entre equipos de cómputo y celulares administrativos/operacionales, con historial cronológico de fallas, piezas y reparaciones por equipo.
 - Bóveda de credenciales cifradas con AES-256-GCM; solo administración puede revelarlas.
 - Agenda de mantenimiento con enlace individual para confirmar o proponer otro horario.
+<<<<<<< HEAD
 - Máximo de dos mantenimientos no cancelados por equipo en cada año calendario; también se valida al aprobar cambios de fecha.
+=======
+- Meta anual de dos mantenimientos preventivos completados por equipo. El avance se calcula por año calendario desde el historial real; pendientes, programados y cancelados no cuentan.
+- Agenda visual mensual con vistas semanal y diaria. Las reservas usan intervalos de 30 minutos entre 8:30 a. m. y 5:00 p. m., con unicidad en MySQL para evitar dobles reservas simultáneas.
+- El personal autorizado puede reprogramar o cancelar servicios. La reprogramación registra la fecha anterior y la nueva en el historial del activo y libera el horario anterior.
+>>>>>>> f9532b313fc86773e4bfdaa276e83f4d291c493e
 - Filtro de mantenimientos por rango de fechas programadas.
 - Cierre del mantenimiento desde su acción con la Orden de Servicio F-SIS-01 firmada por el usuario y quien realizó el trabajo; documento y cierre se guardan juntos.
 - Constancia de mantenimiento imprimible/guardable como PDF desde el navegador.

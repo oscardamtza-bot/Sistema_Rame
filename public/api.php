@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 require __DIR__ . '/../app/bootstrap.php';
 
+const TECHNICIAN_NAMES = ['DULCE MARIA MUÑIZ LOPEZ', 'OSCAR DANIEL MARTINEZ AGUIRRE', 'CESAR ELIUD BERNAL RIVERA'];
+
 $action = $_GET['action'] ?? '';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
@@ -46,38 +48,35 @@ function normalize_person_key(string $name): string
 }
 
 /** Read current equipment and assignment data from Activos. */
-function department_assets(string $department, bool $includeEmailSuggestions = false): array
+function department_assets(string $department): array
 {
     $statement = db()->prepare('SELECT id, asset_tag, type, brand, model, status, assigned_user_id, source_assignee_name FROM assets WHERE department=? AND status<>"retired" ORDER BY asset_tag');
     $statement->execute([$department]);
     $assets = $statement->fetchAll();
-    if (!$assets) return ['assets' => [], 'emailSuggestions' => []];
+    if (!$assets) return ['assets' => []];
 
     $assetIds = array_map('intval', array_column($assets, 'id'));
     $placeholders = implode(',', array_fill(0, count($assetIds), '?'));
     $peopleByAsset = [];
-    $emails = [];
-    $addPerson = static function (int $assetId, string $name, ?string $email = null) use (&$peopleByAsset, &$emails, $includeEmailSuggestions): void {
+    $addPerson = static function (int $assetId, string $name) use (&$peopleByAsset): void {
         $name = trim(preg_replace('/\s+/u', ' ', $name) ?? $name);
         if ($name === '') return;
-        $key = normalize_person_key($name);
-        $peopleByAsset[$assetId][$key] = $name;
-        if ($includeEmailSuggestions && $email && filter_var($email, FILTER_VALIDATE_EMAIL)) $emails[strtolower($email)] = $email;
+        $peopleByAsset[$assetId][normalize_person_key($name)] = $name;
     };
 
-    $assignees = db()->prepare("SELECT aa.asset_id, aa.person_name, COALESCE(u.email, matched.email) AS email FROM asset_assignees aa LEFT JOIN users u ON u.id=aa.user_id LEFT JOIN users matched ON aa.user_id IS NULL AND LOWER(TRIM(matched.name))=LOWER(TRIM(aa.person_name)) WHERE aa.asset_id IN ({$placeholders})");
+    $assignees = db()->prepare("SELECT asset_id, person_name FROM asset_assignees WHERE asset_id IN ({$placeholders})");
     $assignees->execute($assetIds);
-    foreach ($assignees->fetchAll() as $row) $addPerson((int) $row['asset_id'], (string) $row['person_name'], $row['email'] ?: null);
+    foreach ($assignees->fetchAll() as $row) $addPerson((int) $row['asset_id'], (string) $row['person_name']);
 
-    $assignedUsers = db()->prepare("SELECT au.asset_id, u.name, u.email FROM asset_users au JOIN users u ON u.id=au.user_id WHERE au.asset_id IN ({$placeholders})");
+    $assignedUsers = db()->prepare("SELECT au.asset_id, u.name FROM asset_users au JOIN users u ON u.id=au.user_id WHERE au.asset_id IN ({$placeholders})");
     $assignedUsers->execute($assetIds);
-    foreach ($assignedUsers->fetchAll() as $row) $addPerson((int) $row['asset_id'], (string) $row['name'], $row['email'] ?: null);
+    foreach ($assignedUsers->fetchAll() as $row) $addPerson((int) $row['asset_id'], (string) $row['name']);
 
     $assignedIds = array_values(array_unique(array_filter(array_map(static fn (array $asset): int => (int) ($asset['assigned_user_id'] ?? 0), $assets))));
     $assignedPeople = [];
     if ($assignedIds) {
         $userPlaceholders = implode(',', array_fill(0, count($assignedIds), '?'));
-        $assignedQuery = db()->prepare("SELECT id,name,email FROM users WHERE id IN ({$userPlaceholders})");
+        $assignedQuery = db()->prepare("SELECT id,name FROM users WHERE id IN ({$userPlaceholders})");
         $assignedQuery->execute($assignedIds);
         foreach ($assignedQuery->fetchAll() as $person) $assignedPeople[(int) $person['id']] = $person;
     }
@@ -86,7 +85,7 @@ function department_assets(string $department, bool $includeEmailSuggestions = f
         $assetId = (int) $asset['id'];
         if (!empty($asset['assigned_user_id'])) {
             $person = $assignedPeople[(int) $asset['assigned_user_id']] ?? null;
-            if ($person) $addPerson($assetId, (string) $person['name'], $person['email'] ?: null);
+            if ($person) $addPerson($assetId, (string) $person['name']);
         }
         foreach (preg_split('/[\r\n;,|]+/', (string) ($asset['source_assignee_name'] ?? ''), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $name) {
             $addPerson($assetId, $name);
@@ -96,21 +95,7 @@ function department_assets(string $department, bool $includeEmailSuggestions = f
     }
     unset($asset);
 
-    return ['assets' => $assets, 'emailSuggestions' => array_values($emails)];
-}
-
-function append_department_request_event(int $requestId, string $eventType, string $details, ?int $actorId = null): void
-{
-    db()->prepare('INSERT INTO maintenance_department_request_history (request_id,event_type,details,actor_id) VALUES (?,?,?,?)')
-        ->execute([$requestId, $eventType, $details !== '' ? $details : null, $actorId]);
-}
-
-function append_linked_maintenance_event(int $maintenanceId, string $eventType, string $details, ?int $actorId = null): void
-{
-    $query = db()->prepare('SELECT request_id FROM maintenance_department_request_services WHERE maintenance_id=? LIMIT 1');
-    $query->execute([$maintenanceId]);
-    $requestId = (int) $query->fetchColumn();
-    if ($requestId) append_department_request_event($requestId, $eventType, $details, $actorId);
+    return ['assets' => $assets];
 }
 
 function department_plan_period(int $year, int $month): array
@@ -119,48 +104,56 @@ function department_plan_period(int $year, int $month): array
     return [$start, $start->modify('first day of next month')];
 }
 
-function send_department_maintenance_email(array $plan, array $assets, string $recipient, string $inviteUrl): array
+function send_maintenance_invitation_email(string $recipientEmail, string $recipientName, array $asset, string $scheduledAt, string $inviteUrl): array
 {
     global $config;
+    $smtp = $config['smtp'] ?? [];
+    $username = trim((string) ($smtp['username'] ?? ''));
+    if (empty($smtp['host']) || empty($smtp['from_email']) || ($username !== '' && empty($smtp['password']))) {
+        return ['sent' => false, 'message' => 'No se envió el correo: falta completar la configuración SMTP.'];
+    }
+
     $autoload = __DIR__ . '/../vendor/autoload.php';
-    if (empty($config['smtp']['host']) || empty($config['smtp']['username']) || empty($config['smtp']['password']) || empty($config['smtp']['from_email']) || !is_file($autoload)) {
-        return ['sent' => false, 'message' => 'No se envió el correo. Falta la configuración Gmail SMTP o PHPMailer.'];
+    if (!is_file($autoload)) {
+        return ['sent' => false, 'message' => 'No se envió el correo: PHPMailer no está disponible.'];
     }
     require_once $autoload;
     $mailerClass = 'PHPMailer\\PHPMailer\\PHPMailer';
-    if (!class_exists($mailerClass)) return ['sent' => false, 'message' => 'No se envió el correo. PHPMailer no está disponible.'];
-    $monthName = (new DateTimeImmutable(sprintf('%04d-%02d-01', (int) $plan['plan_year'], (int) $plan['plan_month'])))->format('F');
-    $rows = [];
-    foreach ($assets as $asset) {
-        $tag = htmlspecialchars((string) $asset['asset_tag'], ENT_QUOTES, 'UTF-8');
-        $details = htmlspecialchars(trim(($asset['brand'] ?? '') . ' ' . ($asset['model'] ?? '')), ENT_QUOTES, 'UTF-8');
-        $people = htmlspecialchars(implode(', ', $asset['assigned_people'] ?? []), ENT_QUOTES, 'UTF-8');
-        $rows[] = '<tr><td style="padding:8px;border:1px solid #d8e3f0"><strong>' . $tag . '</strong></td><td style="padding:8px;border:1px solid #d8e3f0">' . $details . '</td><td style="padding:8px;border:1px solid #d8e3f0">' . ($people !== '' ? $people : 'Sin persona asignada en Activos') . '</td></tr>';
+    if (!class_exists($mailerClass)) {
+        return ['sent' => false, 'message' => 'No se envió el correo: PHPMailer no está disponible.'];
     }
+
+    $date = (new DateTimeImmutable($scheduledAt))->format('d/m/Y H:i');
+    $assetLabel = trim((string) $asset['asset_tag'] . ' · ' . (string) $asset['brand'] . ' ' . (string) $asset['model']);
     try {
         $mail = new $mailerClass(true);
         $mail->isSMTP();
-        $mail->Host = $config['smtp']['host'];
-        $mail->Port = $config['smtp']['port'];
-        $mail->SMTPAuth = true;
-        $mail->Username = $config['smtp']['username'];
-        $mail->Password = $config['smtp']['password'];
-        if ($config['smtp']['encryption'] === 'tls') $mail->SMTPSecure = constant($mailerClass . '::ENCRYPTION_STARTTLS');
-        elseif ($config['smtp']['encryption'] === 'ssl') $mail->SMTPSecure = constant($mailerClass . '::ENCRYPTION_SMTPS');
+        $mail->Host = (string) $smtp['host'];
+        $mail->Port = (int) ($smtp['port'] ?? 587);
+        $mail->SMTPAuth = $username !== '';
+        $mail->Username = $username;
+        $mail->Password = (string) ($smtp['password'] ?? '');
+        if (($smtp['encryption'] ?? '') === 'tls') {
+            $mail->SMTPSecure = constant($mailerClass . '::ENCRYPTION_STARTTLS');
+        } elseif (($smtp['encryption'] ?? '') === 'ssl') {
+            $mail->SMTPSecure = constant($mailerClass . '::ENCRYPTION_SMTPS');
+        }
         $mail->CharSet = 'UTF-8';
-        $mail->setFrom($config['smtp']['from_email'], $config['smtp']['from_name']);
-        $mail->addAddress($recipient);
+        $mail->setFrom((string) $smtp['from_email'], (string) ($smtp['from_name'] ?? 'Rame TI'));
+        $mail->addAddress($recipientEmail, $recipientName);
         $mail->isHTML(true);
-        $mail->Subject = 'Confirmación de mantenimiento preventivo · ' . $plan['department'];
-        $safeDepartment = htmlspecialchars((string) $plan['department'], ENT_QUOTES, 'UTF-8');
-        $safeUrl = htmlspecialchars($inviteUrl, ENT_QUOTES, 'UTF-8');
-        $mail->Body = '<p>El área de TI solicita coordinar el mantenimiento preventivo del departamento <strong>' . $safeDepartment . '</strong> para ' . $monthName . ' de ' . (int) $plan['plan_year'] . '.</p><p>Equipos incluidos: <strong>' . count($assets) . '</strong></p><table style="border-collapse:collapse;width:100%"><thead><tr><th style="padding:8px;border:1px solid #d8e3f0">Inventario</th><th style="padding:8px;border:1px solid #d8e3f0">Equipo</th><th style="padding:8px;border:1px solid #d8e3f0">Persona(s) asignada(s)</th></tr></thead><tbody>' . implode('', $rows) . '</tbody></table><p>Abra el enlace para revisar la solicitud y elegir fecha y hora de inicio. El sistema asignará un espacio de 30 minutos por equipo desde el horario elegido, omitirá los espacios ocupados y continuará en días posteriores del mismo mes si hace falta. La atención es de 8:30 a. m. a 5:00 p. m.</p><p><a href="' . $safeUrl . '">Revisar equipos y confirmar horario</a></p>';
-        $mail->AltBody = 'Mantenimiento preventivo de ' . $plan['department'] . ' en ' . $monthName . ' de ' . $plan['plan_year'] . '. Equipos: ' . count($assets) . '. Revise y confirme el horario: ' . $inviteUrl;
-        $mail->send();
-        return ['sent' => true, 'message' => 'Gmail SMTP aceptó el correo. La entrega final depende del servicio del destinatario.'];
+        $mail->Subject = 'Agenda tu mantenimiento preventivo';
+        $mail->Body = '<p>Hola ' . htmlspecialchars($recipientName, ENT_QUOTES, 'UTF-8') . ',</p>'
+            . '<p>Se programó el mantenimiento de <strong>' . htmlspecialchars($assetLabel, ENT_QUOTES, 'UTF-8') . '</strong> para el ' . $date . '.</p>'
+            . '<p><a href="' . htmlspecialchars($inviteUrl, ENT_QUOTES, 'UTF-8') . '">Confirma el horario o propone otro</a></p>';
+        $mail->AltBody = "Hola {$recipientName}, se programó el mantenimiento de {$assetLabel} para el {$date}. Confirma el horario o propone otro: {$inviteUrl}";
+        if (!$mail->send()) {
+            return ['sent' => false, 'message' => 'PHPMailer no confirmó el envío. Comparte la invitación manualmente.'];
+        }
+        return ['sent' => true, 'message' => 'PHPMailer confirmó el envío del correo.'];
     } catch (Throwable $error) {
-        error_log('[Rame department mail] SMTP send failed.');
-        return ['sent' => false, 'message' => 'Gmail SMTP no confirmó el envío. Revisa la configuración y vuelve a intentar.'];
+        error_log('[Rame mail] SMTP send failed.');
+        return ['sent' => false, 'message' => 'PHPMailer no confirmó el envío. Comparte la invitación manualmente.'];
     }
 }
 
@@ -217,19 +210,30 @@ try {
     }
 
     if ($action === 'invite' && $method === 'GET') {
-        $token = clean_string($_GET['token'] ?? '', 120);
-        $statement = db()->prepare('SELECT m.id, m.scheduled_at, m.proposed_at, m.status, m.notes, a.asset_tag, a.brand, a.model, u.name AS user_name FROM maintenance m JOIN assets a ON a.id = m.asset_id JOIN users u ON u.id = m.user_id WHERE m.invite_token_hash = ? LIMIT 1');
+        $token = strtolower(trim((string) ($_GET['token'] ?? '')));
+        if (!preg_match('/\A[a-f0-9]{64}\z/', $token)) {
+            json_response(['error' => 'El enlace no existe o ya no es válido.'], 404);
+        }
+        $statement = db()->prepare('SELECT m.id, m.scheduled_at, m.proposed_at, m.status, m.notes, a.asset_tag, a.brand, a.model, u.name AS user_name FROM maintenance m JOIN assets a ON a.id=m.asset_id JOIN users u ON u.id=m.user_id WHERE m.invite_token_hash=? LIMIT 1');
         $statement->execute([hash('sha256', $token)]);
         $invite = $statement->fetch();
         if (!$invite) {
             json_response(['error' => 'El enlace no existe o ya no es válido.'], 404);
         }
+        $saved = json_decode((string) ($invite['notes'] ?? ''), true);
+        if (is_array($saved) && ($saved['_rame_service'] ?? false) === true) {
+            $invite['user_name'] = (string) ($saved['person_name'] ?? $invite['user_name']);
+            $invite['notes'] = (string) ($saved['service_notes'] ?? '');
+        }
         json_response(['invite' => $invite]);
     }
 
     if ($action === 'invite-availability' && $method === 'GET') {
-        $token = clean_string($_GET['token'] ?? '', 120);
-        $dateValue = clean_string($_GET['date'] ?? '', 10);
+        $token = strtolower(trim((string) ($_GET['token'] ?? '')));
+        $dateValue = trim((string) ($_GET['date'] ?? ''));
+        if (!preg_match('/\A[a-f0-9]{64}\z/', $token)) {
+            json_response(['error' => 'Esta invitación ya no está disponible.'], 404);
+        }
         $date = DateTimeImmutable::createFromFormat('!Y-m-d', $dateValue);
         $errors = DateTimeImmutable::getLastErrors();
         if (!$date || ($errors !== false && ($errors['warning_count'] || $errors['error_count'])) || $date->format('Y-m-d') !== $dateValue) {
@@ -254,417 +258,149 @@ try {
     }
 
     if ($action === 'invite-response' && $method === 'POST') {
-        $token = clean_string($data['token'] ?? '', 120);
+        $token = strtolower(trim((string) ($data['token'] ?? '')));
         $choice = $data['choice'] ?? '';
-        $proposed = $data['proposedAt'] ?? null;
-        $statement = db()->prepare('SELECT id, status FROM maintenance WHERE invite_token_hash = ? LIMIT 1');
-        $statement->execute([hash('sha256', $token)]);
-        $invite = $statement->fetch();
-        if (!$invite || in_array($invite['status'], ['completed', 'cancelled'], true)) {
-            json_response(['error' => 'Esta invitación ya no está disponible.'], 409);
+        $proposedAt = $data['proposedAt'] ?? null;
+        if (!preg_match('/\A[a-f0-9]{64}\z/', $token)) {
+            json_response(['error' => 'Esta invitación ya no está disponible.'], 404);
         }
-        if ($choice === 'confirm') {
-            db()->prepare('UPDATE maintenance SET status = "confirmed", proposed_at = NULL WHERE id = ?')->execute([$invite['id']]);
-        } elseif ($choice === 'reschedule' && is_string($proposed) && ($proposedDate = parse_maintenance_slot($proposed))) {
-            try {
-                db()->prepare('UPDATE maintenance SET status = "reschedule_requested", proposed_at = ? WHERE id = ?')->execute([$proposedDate->format('Y-m-d H:i:s'), $invite['id']]);
-            } catch (Throwable $error) {
-                if (is_duplicate_slot_error($error)) json_response(['error' => 'Ese horario acaba de ocuparse. Elige otro horario disponible.'], 409);
-                throw $error;
-            }
-        } else {
+        $proposedDate = $choice === 'reschedule' && is_string($proposedAt) ? parse_maintenance_slot($proposedAt) : null;
+        if ($choice !== 'confirm' && ($choice !== 'reschedule' || !$proposedDate)) {
             json_response(['error' => 'Selecciona una opción y una fecha futura válida.'], 422);
         }
-        json_response(['ok' => true]);
-    }
-
-    if ($action === 'department-invite' && $method === 'GET') {
-        $token = clean_string($_GET['token'] ?? '', 120);
-        $statement = db()->prepare('SELECT t.id AS token_id, t.status AS token_status, t.expires_at, r.id AS request_id, r.status AS request_status, r.scheduled_start, r.confirmed_at, p.plan_year, p.plan_month, p.department FROM maintenance_department_request_tokens t JOIN maintenance_department_requests r ON r.id=t.request_id JOIN maintenance_department_plans p ON p.id=r.plan_id WHERE t.token_hash=? AND t.expires_at>NOW() AND t.status IN ("sent","confirmed") LIMIT 1');
-        $statement->execute([hash('sha256', $token)]);
-        $invite = $statement->fetch();
-        if (!$invite) json_response(['error' => 'El enlace no existe, venció o ya no está disponible.'], 404);
-        $itemsQuery = db()->prepare('SELECT COALESCE(a.asset_tag,ra.asset_tag_snapshot) AS asset_tag, a.type, a.brand, a.model, ra.assigned_people_snapshot FROM maintenance_department_request_assets ra LEFT JOIN assets a ON a.id=ra.asset_id WHERE ra.token_id=? ORDER BY ra.asset_tag_snapshot');
-        $itemsQuery->execute([(int) $invite['token_id']]);
-        $items = $itemsQuery->fetchAll();
-        json_response(['invite' => [
-            'department' => $invite['department'], 'year' => (int) $invite['plan_year'], 'month' => (int) $invite['plan_month'],
-            'status' => $invite['request_status'], 'tokenStatus' => $invite['token_status'], 'scheduledStart' => $invite['scheduled_start'],
-            'confirmedAt' => $invite['confirmed_at'], 'itemCount' => count($items), 'items' => $items,
-        ]]);
-    }
-
-    if ($action === 'department-availability' && $method === 'GET') {
-        $token = clean_string($_GET['token'] ?? '', 120);
-        $dateValue = clean_string($_GET['date'] ?? '', 10);
-        $date = DateTimeImmutable::createFromFormat('!Y-m-d', $dateValue);
-        $errors = DateTimeImmutable::getLastErrors();
-        if (!$date || ($errors !== false && ($errors['warning_count'] || $errors['error_count'])) || $date->format('Y-m-d') !== $dateValue) {
-            json_response(['error' => 'Selecciona una fecha válida.'], 422);
-        }
-        $inviteQuery = db()->prepare('SELECT t.id AS token_id, t.status, r.id AS request_id, r.status AS request_status, p.plan_year, p.plan_month FROM maintenance_department_request_tokens t JOIN maintenance_department_requests r ON r.id=t.request_id JOIN maintenance_department_plans p ON p.id=r.plan_id WHERE t.token_hash=? AND t.expires_at>NOW() LIMIT 1');
-        $inviteQuery->execute([hash('sha256', $token)]);
-        $invite = $inviteQuery->fetch();
-        if (!$invite || $invite['status'] !== 'sent' || $invite['request_status'] !== 'email_sent') {
-            json_response(['error' => 'Esta solicitud ya no acepta cambios de horario.'], 409);
-        }
-        if ((int) $date->format('Y') !== (int) $invite['plan_year'] || (int) $date->format('n') !== (int) $invite['plan_month'] || $date->getTimestamp() <= time()) {
-            json_response(['error' => 'Elige una fecha futura dentro del periodo de mantenimiento indicado.'], 422);
-        }
-        $itemCountQuery = db()->prepare('SELECT COUNT(*) FROM maintenance_department_request_assets WHERE token_id=? AND asset_id IS NOT NULL');
-        $itemCountQuery->execute([(int) $invite['token_id']]);
-        $itemCount = (int) $itemCountQuery->fetchColumn();
-        if ($itemCount < 1) json_response(['error' => 'La solicitud no tiene equipos disponibles para programar.'], 409);
-
-        [$periodStart, $periodEnd] = department_plan_period((int) $invite['plan_year'], (int) $invite['plan_month']);
-        $busyQuery = db()->prepare('SELECT DATE_FORMAT(reserved_slot,"%Y-%m-%d %H:%i") FROM maintenance WHERE reserved_slot>=? AND reserved_slot<?');
-        $busyQuery->execute([$periodStart->format('Y-m-d H:i:s'), $periodEnd->format('Y-m-d H:i:s')]);
-        $busy = array_fill_keys($busyQuery->fetchAll(PDO::FETCH_COLUMN), true);
-        $now = new DateTimeImmutable('now');
-        $slots = [];
-            for ($minute = 510; $minute < 1020; $minute += 30) {
-            $time = sprintf('%02d:%02d', intdiv($minute, 60), $minute % 60);
-            $candidate = DateTimeImmutable::createFromFormat('!Y-m-d H:i', $dateValue . ' ' . $time);
-            $available = $candidate && $candidate > $now && !isset($busy[$candidate->format('Y-m-d H:i')]);
-            $freeCount = 0;
-            if ($available) {
-                for ($day = $date; $day < $periodEnd && $freeCount < $itemCount; $day = $day->modify('+1 day')) {
-                    $firstMinute = $day->format('Y-m-d') === $dateValue ? $minute : 510;
-                    for ($nextMinute = $firstMinute; $nextMinute < 1020 && $freeCount < $itemCount; $nextMinute += 30) {
-                        $nextSlot = DateTimeImmutable::createFromFormat('!Y-m-d H:i', $day->format('Y-m-d') . ' ' . sprintf('%02d:%02d', intdiv($nextMinute, 60), $nextMinute % 60));
-                        if ($nextSlot > $now && !isset($busy[$nextSlot->format('Y-m-d H:i')])) $freeCount++;
-                    }
-                }
-                $available = $freeCount >= $itemCount;
-            }
-            $slots[] = ['time' => $time, 'available' => $available];
-        }
-        json_response(['date' => $dateValue, 'requiredEquipment' => $itemCount, 'slots' => $slots]);
-    }
-
-    if ($action === 'department-confirm' && $method === 'POST') {
-        $token = clean_string($data['token'] ?? '', 120);
-        $scheduledAt = parse_maintenance_slot((string) ($data['scheduledAt'] ?? ''));
-        if (!$scheduledAt) json_response(['error' => 'Elige un horario futuro disponible dentro de la atención.'], 422);
         db()->beginTransaction();
         try {
-            $tokenQuery = db()->prepare('SELECT t.id AS token_id, t.status AS token_status, t.expires_at, r.id AS request_id, r.status AS request_status, r.created_by, p.id AS plan_id, p.plan_year, p.plan_month, p.department FROM maintenance_department_request_tokens t JOIN maintenance_department_requests r ON r.id=t.request_id JOIN maintenance_department_plans p ON p.id=r.plan_id WHERE t.token_hash=? FOR UPDATE');
-            $tokenQuery->execute([hash('sha256', $token)]);
-            $invite = $tokenQuery->fetch();
-            if (!$invite || $invite['token_status'] !== 'sent' || $invite['request_status'] !== 'email_sent' || strtotime((string) $invite['expires_at']) <= time()) {
+            $inviteQuery = db()->prepare('SELECT id, status FROM maintenance WHERE invite_token_hash=? FOR UPDATE');
+            $inviteQuery->execute([hash('sha256', $token)]);
+            $invite = $inviteQuery->fetch();
+            if (!$invite || in_array($invite['status'], ['completed', 'cancelled'], true)) {
                 db()->rollBack();
-                json_response(['error' => 'La solicitud venció, ya fue confirmada o dejó de estar disponible.'], 409);
+                json_response(['error' => 'Esta invitación ya no está disponible.'], 409);
             }
-            if ((int) $scheduledAt->format('Y') !== (int) $invite['plan_year'] || (int) $scheduledAt->format('n') !== (int) $invite['plan_month']) {
-                db()->rollBack();
-                json_response(['error' => 'El horario debe estar dentro del periodo de mantenimiento de la solicitud.'], 422);
+            if ($choice === 'confirm') {
+                db()->prepare('UPDATE maintenance SET status="confirmed", proposed_at=NULL WHERE id=?')->execute([$invite['id']]);
+            } else {
+                db()->prepare('UPDATE maintenance SET status="reschedule_requested", proposed_at=? WHERE id=?')
+                    ->execute([$proposedDate->format('Y-m-d H:i:s'), $invite['id']]);
             }
-            $requestAssetsQuery = db()->prepare('SELECT ra.asset_id, ra.asset_tag_snapshot, ra.assigned_people_snapshot, a.department, a.status FROM maintenance_department_request_assets ra LEFT JOIN assets a ON a.id=ra.asset_id WHERE ra.token_id=? ORDER BY ra.asset_tag_snapshot FOR UPDATE');
-            $requestAssetsQuery->execute([(int) $invite['token_id']]);
-            $requestAssets = $requestAssetsQuery->fetchAll();
-            if (!$requestAssets) {
-                db()->rollBack();
-                json_response(['error' => 'La solicitud no incluye equipos vigentes. Contacta al área de TI.'], 409);
-            }
-            foreach ($requestAssets as $item) {
-                if (!$item['asset_id'] || $item['status'] === 'retired' || trim((string) $item['department']) !== trim((string) $invite['department'])) {
-                    db()->rollBack();
-                    json_response(['error' => 'Cambió el inventario incluido en la solicitud. Contacta al área de TI para actualizarla.'], 409);
-                }
-            }
-            [$periodStart, $periodEnd] = department_plan_period((int) $invite['plan_year'], (int) $invite['plan_month']);
-            $monthBusyQuery = db()->prepare('SELECT DATE_FORMAT(reserved_slot,"%Y-%m-%d %H:%i") FROM maintenance WHERE reserved_slot>=? AND reserved_slot<?');
-            $monthBusyQuery->execute([$periodStart->format('Y-m-d H:i:s'), $periodEnd->format('Y-m-d H:i:s')]);
-            $busy = array_fill_keys($monthBusyQuery->fetchAll(PDO::FETCH_COLUMN), true);
-            $candidateKey = $scheduledAt->format('Y-m-d H:i');
-            if ($scheduledAt < $periodStart || $scheduledAt >= $periodEnd || isset($busy[$candidateKey])) {
-                db()->rollBack();
-                json_response(['error' => 'Ese horario acaba de ocuparse o no corresponde al periodo solicitado. Actualiza la disponibilidad.'], 409);
-            }
-            $slots = [];
-            for ($day = new DateTimeImmutable($scheduledAt->format('Y-m-d')); $day < $periodEnd && count($slots) < count($requestAssets); $day = $day->modify('+1 day')) {
-                $firstMinute = $day->format('Y-m-d') === $scheduledAt->format('Y-m-d') ? ((int) $scheduledAt->format('H') * 60 + (int) $scheduledAt->format('i')) : 510;
-                for ($minute = $firstMinute; $minute < 1020 && count($slots) < count($requestAssets); $minute += 30) {
-                    $slot = DateTimeImmutable::createFromFormat('!Y-m-d H:i', $day->format('Y-m-d') . ' ' . sprintf('%02d:%02d', intdiv($minute, 60), $minute % 60));
-                    $key = $slot->format('Y-m-d H:i');
-                    if ($slot > new DateTimeImmutable('now') && !isset($busy[$key])) {
-                        $slots[] = $slot;
-                        $busy[$key] = true;
-                    }
-                }
-            }
-            if (count($slots) !== count($requestAssets)) {
-                db()->rollBack();
-                json_response(['error' => 'Ya no hay suficientes horarios consecutivos disponibles durante este periodo. Actualiza disponibilidad e intenta otra hora.'], 409);
-            }
-            $insertMaintenance = db()->prepare('INSERT INTO maintenance (asset_id,user_id,technician_id,scheduled_at,status,invite_token_hash,notes) VALUES (?,?,?, ?,"confirmed",?,?)');
-            $insertService = db()->prepare('INSERT INTO maintenance_department_request_services (request_id,asset_id,maintenance_id) VALUES (?,?,?)');
-            foreach ($requestAssets as $index => $item) {
-                $serviceNotes = json_encode([
-                    '_rame_service' => true,
-                    'person_name' => (string) ($item['assigned_people_snapshot'] ?: 'Sin persona asignada en Activos'),
-                    'service_notes' => 'Mantenimiento preventivo del departamento ' . $invite['department'] . ' (' . (int) $invite['plan_month'] . '/' . (int) $invite['plan_year'] . ').',
-                ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-                $insertMaintenance->execute([(int) $item['asset_id'], (int) $invite['created_by'], (int) $invite['created_by'], $slots[$index]->format('Y-m-d H:i:s'), hash('sha256', bin2hex(random_bytes(32))), $serviceNotes]);
-                $insertService->execute([(int) $invite['request_id'], (int) $item['asset_id'], (int) db()->lastInsertId()]);
-            }
-            db()->prepare('UPDATE maintenance_department_requests SET status="confirmed", scheduled_start=?, confirmed_at=NOW() WHERE id=? AND status="email_sent"')
-                ->execute([$scheduledAt->format('Y-m-d H:i:s'), (int) $invite['request_id']]);
-            db()->prepare('UPDATE maintenance_department_request_tokens SET status="confirmed", confirmed_at=NOW() WHERE id=? AND status="sent"')
-                ->execute([(int) $invite['token_id']]);
-            db()->prepare('UPDATE maintenance_department_request_tokens SET status="revoked" WHERE request_id=? AND id<>? AND status IN ("sent","sending")')
-                ->execute([(int) $invite['request_id'], (int) $invite['token_id']]);
-            append_department_request_event((int) $invite['request_id'], 'confirmed', count($requestAssets) . ' equipos programados desde ' . $scheduledAt->format('Y-m-d H:i') . '.', (int) $invite['created_by']);
             db()->commit();
-            json_response(['ok' => true, 'scheduledCount' => count($requestAssets), 'scheduledStart' => $scheduledAt->format('Y-m-d H:i:s')]);
         } catch (Throwable $error) {
-            if (db()->inTransaction()) db()->rollBack();
-            if (is_duplicate_slot_error($error)) json_response(['error' => 'Uno de los horarios acaba de ocuparse. No se registró ningún equipo; consulta de nuevo la disponibilidad.'], 409);
+            if (db()->inTransaction()) {
+                db()->rollBack();
+            }
+            if (is_duplicate_slot_error($error)) {
+                json_response(['error' => 'Ese horario acaba de ocuparse. Elige otro horario disponible.'], 409);
+            }
             throw $error;
         }
+        json_response(['ok' => true]);
     }
 
     $user = require_user();
 
-    if ($action === 'maintenance-department-plan' && $method === 'GET') {
+    if (in_array($action, ['maintenance-program', 'maintenance-program-export'], true) && $method === 'GET') {
         require_role(['admin', 'technician']);
         $year = (int) ($_GET['year'] ?? date('Y'));
         if ($year < 2000 || $year > 2200) $year = (int) date('Y');
-        $departmentRows = db()->query("SELECT COALESCE(NULLIF(TRIM(department),''),'') AS department, COUNT(*) AS total_assets, SUM(status<>'retired') AS active_assets, SUM(status='retired') AS retired_assets FROM assets GROUP BY COALESCE(NULLIF(TRIM(department),''),'') ORDER BY department")->fetchAll();
-        $departments = [];
-        foreach ($departmentRows as $row) {
-            $department = trim((string) $row['department']);
-            if ($department === '') continue;
-            $details = department_assets($department, true);
-            $departments[] = [
-                'name' => $department, 'totalAssets' => (int) $row['total_assets'], 'activeAssets' => count($details['assets']),
-                'retiredAssets' => (int) $row['retired_assets'], 'eligible' => count($details['assets']) > 0,
-                'assets' => $details['assets'], 'emailSuggestions' => $details['emailSuggestions'],
-                'unclassified' => in_array(mb_strtoupper($department, 'UTF-8'), ['SIN ASIGNAR', 'SIN DEPARTAMENTO'], true),
-            ];
+        $statement = db()->prepare('SELECT seq, model, serial_number, asset_tag, department, monitor_code, planned_months FROM maintenance_program_items WHERE plan_year=? ORDER BY seq, asset_tag');
+        $statement->execute([$year]);
+        // Un mes cuenta como realizado cuando existe una Orden de Servicio F-SIS-01 firmada o un mantenimiento completado en ese mes.
+        $done = [];
+        $docs = db()->prepare('SELECT a.asset_tag, MONTH(COALESCE(d.performed_by_signed_at, d.signed_at, d.created_at)) AS m FROM responsibility_documents d JOIN assets a ON a.id=d.asset_id WHERE d.form_type="service_order" AND d.performed_by_signed_at IS NOT NULL AND YEAR(COALESCE(d.performed_by_signed_at, d.signed_at, d.created_at))=?');
+        $docs->execute([$year]);
+        foreach ($docs->fetchAll() as $row) $done[strtoupper(trim((string) $row['asset_tag']))][(int) $row['m']] = true;
+        $completed = db()->prepare('SELECT a.asset_tag, MONTH(m.completed_at) AS m FROM maintenance m JOIN assets a ON a.id=m.asset_id WHERE m.status="completed" AND m.completed_at IS NOT NULL AND YEAR(m.completed_at)=?');
+        $completed->execute([$year]);
+        foreach ($completed->fetchAll() as $row) $done[strtoupper(trim((string) $row['asset_tag']))][(int) $row['m']] = true;
+        $items = [];
+        $planned = 0; $realized = 0;
+        foreach ($statement->fetchAll() as $row) {
+            $months = array_values(array_filter(array_map('intval', explode(',', (string) $row['planned_months']))));
+            $doneMonths = array_keys($done[strtoupper((string) $row['asset_tag'])] ?? []);
+            sort($doneMonths);
+            $planned += count($months);
+            $realized += count(array_intersect($months, $doneMonths));
+            $items[] = ['seq' => (int) $row['seq'], 'model' => $row['model'], 'serial' => $row['serial_number'], 'tag' => $row['asset_tag'], 'department' => $row['department'], 'monitor' => $row['monitor_code'], 'months' => $months, 'done' => $doneMonths];
         }
-        $unclassifiedQuery = db()->query("SELECT id, asset_tag, type, brand, model, department, status FROM assets WHERE NULLIF(TRIM(department),'') IS NULL OR UPPER(TRIM(department)) IN ('SIN ASIGNAR','SIN DEPARTAMENTO') ORDER BY status, asset_tag");
-        $unclassifiedAssets = $unclassifiedQuery->fetchAll();
-        $planQuery = db()->prepare('SELECT p.id, p.plan_month, p.department, p.recipient_email, p.is_active, r.id AS request_id, CASE WHEN r.status="email_sent" AND (SELECT MAX(t0.expires_at) FROM maintenance_department_request_tokens t0 WHERE t0.request_id=r.id)<=NOW() THEN "expired" ELSE r.status END AS request_status, r.recipient_email AS request_email, r.scheduled_start, r.confirmed_at, (SELECT COUNT(*) FROM maintenance_department_request_assets ra WHERE ra.token_id=(SELECT MAX(t.id) FROM maintenance_department_request_tokens t WHERE t.request_id=r.id)) AS included_assets, (SELECT COUNT(*) FROM maintenance_department_request_services s JOIN maintenance m ON m.id=s.maintenance_id WHERE s.request_id=r.id AND m.status="completed") AS completed_assets, (SELECT COUNT(*) FROM maintenance_department_request_services s JOIN maintenance m ON m.id=s.maintenance_id WHERE s.request_id=r.id AND m.status IN ("pending","confirmed","reschedule_requested")) AS pending_assets, (SELECT COUNT(*) FROM maintenance_department_request_services s JOIN maintenance m ON m.id=s.maintenance_id WHERE s.request_id=r.id AND m.status="cancelled") AS cancelled_assets, (SELECT COUNT(*) FROM maintenance_department_request_services s JOIN maintenance m ON m.id=s.maintenance_id WHERE s.request_id=r.id AND m.status="reschedule_requested") AS reschedule_requests, (SELECT COUNT(*) FROM maintenance_department_request_history h WHERE h.request_id=r.id AND h.event_type IN ("maintenance_rescheduled","reschedule_requested")) AS reschedule_events FROM maintenance_department_plans p LEFT JOIN maintenance_department_requests r ON r.plan_id=p.id WHERE p.plan_year=? AND p.is_active=1 ORDER BY p.plan_month,p.department');
-        $planQuery->execute([$year]);
-        $plans = $planQuery->fetchAll();
-        foreach ($plans as &$plan) {
-            $departmentData = null;
-            foreach ($departments as $department) if ($department['name'] === $plan['department']) { $departmentData = $department; break; }
-            $activeCount = $departmentData['activeAssets'] ?? 0;
-            $plan['included_assets'] = (int) $plan['included_assets'];
-            $plan['completed_assets'] = (int) $plan['completed_assets'];
-            $plan['pending_assets'] = max(0, $activeCount - (int) $plan['completed_assets']);
-            $plan['cancelled_assets'] = (int) $plan['cancelled_assets'];
-            $plan['current_assets'] = (int) $activeCount;
-            $plan['progress'] = $activeCount > 0 ? (int) floor(min(1, $plan['completed_assets'] / $activeCount) * 100) : 0;
-            $plan['reschedule_events'] = (int) $plan['reschedule_events'];
+        // Si el año no tiene encabezado propio, hereda el del año anterior más reciente.
+        $metaStatement = db()->prepare('SELECT revision, issue_date, revision_date, updated_by_name, updated_on FROM maintenance_program_meta WHERE plan_year<=? ORDER BY plan_year DESC LIMIT 1');
+        $metaStatement->execute([$year]);
+        $meta = $metaStatement->fetch() ?: ['revision' => 'P', 'issue_date' => '25 de Abril del 2023', 'revision_date' => '13 de Febrero de 2026', 'updated_by_name' => '', 'updated_on' => ''];
+        if ($action === 'maintenance-program-export') {
+            require_once __DIR__ . '/../app/xlsx_program.php';
+            $binary = xlsx_build_program($year, $items, $meta);
+            header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            header('Content-Disposition: attachment; filename="D-SIS-01_Programa_Mantenimiento_' . $year . '.xlsx"');
+            header('Content-Length: ' . strlen($binary));
+            echo $binary;
+            exit;
         }
-        unset($plan);
-        $historyQuery = db()->prepare('SELECT id, plan_year, plan_month, department, action, previous_email, recipient_email, changed_at FROM maintenance_department_plan_history WHERE plan_year=? ORDER BY changed_at DESC,id DESC');
-        $historyQuery->execute([$year]);
-        $years = array_map('intval', db()->query('SELECT DISTINCT plan_year FROM maintenance_department_plans ORDER BY plan_year DESC')->fetchAll(PDO::FETCH_COLUMN));
-        if (!in_array($year, $years, true)) array_unshift($years, $year);
-        $months = [];
-        for ($month = 1; $month <= 12; $month++) {
-            $months[] = ['month' => $month, 'departments' => array_values(array_filter($plans, static fn (array $plan): bool => (int) $plan['plan_month'] === $month))];
-        }
-        $emailReady = !empty($config['smtp']['host']) && !empty($config['smtp']['username']) && !empty($config['smtp']['password']) && !empty($config['smtp']['from_email']) && is_file(__DIR__ . '/../vendor/autoload.php');
-        json_response(['year' => $year, 'years' => $years, 'departments' => $departments, 'unclassifiedAssets' => $unclassifiedAssets, 'plans' => $plans, 'months' => $months, 'history' => $historyQuery->fetchAll(), 'emailReady' => $emailReady]);
+        json_response(['year' => $year, 'items' => $items, 'planned' => $planned, 'realized' => $realized, 'meta' => $meta]);
     }
 
-    if ($action === 'maintenance-department-preview' && $method === 'GET') {
-        require_role(['admin']);
-        $planId = (int) ($_GET['id'] ?? 0);
-        $planQuery = db()->prepare('SELECT p.id,p.plan_year,p.plan_month,p.department,p.recipient_email,r.id AS request_id,r.status AS request_status,r.recipient_email AS request_email,r.scheduled_start,r.confirmed_at,(SELECT t.status FROM maintenance_department_request_tokens t WHERE t.request_id=r.id ORDER BY t.id DESC LIMIT 1) AS latest_token_status,(SELECT t.sent_at FROM maintenance_department_request_tokens t WHERE t.request_id=r.id ORDER BY t.id DESC LIMIT 1) AS latest_sent_at FROM maintenance_department_plans p LEFT JOIN maintenance_department_requests r ON r.plan_id=p.id WHERE p.id=? AND p.is_active=1');
-        $planQuery->execute([$planId]);
-        $plan = $planQuery->fetch();
-        if (!$plan) json_response(['error' => 'El departamento ya no está incluido en el programa.'], 404);
-        $details = department_assets((string) $plan['department'], true);
-        $mailReady = !empty($config['smtp']['host']) && !empty($config['smtp']['username']) && !empty($config['smtp']['password']) && !empty($config['smtp']['from_email']) && is_file(__DIR__ . '/../vendor/autoload.php');
-        json_response(['plan' => $plan, 'assets' => $details['assets'], 'emailSuggestions' => $details['emailSuggestions'], 'emailReady' => $mailReady]);
-    }
-
-    if ($action === 'maintenance-department-plan-save' && $method === 'POST') {
+    if ($action === 'maintenance-program-meta' && $method === 'POST') {
         require_role(['admin']);
         $year = (int) ($data['year'] ?? 0);
-        $month = (int) ($data['month'] ?? 0);
-        $departments = $data['departments'] ?? [];
-        if ($year < 2000 || $year > 2200 || $month < 1 || $month > 12 || !is_array($departments) || count($departments) > 50) {
-            json_response(['error' => 'Indica un año, mes y departamentos válidos.'], 422);
-        }
-        $departments = array_values(array_unique(array_filter(array_map(static fn ($value): string => clean_text($value, 140), $departments))));
-        db()->beginTransaction();
-        try {
-            $currentQuery = db()->prepare('SELECT id,department,recipient_email,is_active FROM maintenance_department_plans WHERE plan_year=? AND plan_month=? FOR UPDATE');
-            $currentQuery->execute([$year, $month]);
-            $currentRows = $currentQuery->fetchAll();
-            $currentByDepartment = [];
-            foreach ($currentRows as $row) $currentByDepartment[(string) $row['department']] = $row;
-
-            $existingDepartments = array_keys($currentByDepartment);
-            $eligibleQuery = db()->query("SELECT DISTINCT TRIM(department) AS department FROM assets WHERE status<>'retired' AND NULLIF(TRIM(department),'') IS NOT NULL AND UPPER(TRIM(department)) NOT IN ('SIN ASIGNAR','SIN DEPARTAMENTO')");
-            $eligible = [];
-            foreach (array_merge($eligibleQuery->fetchAll(PDO::FETCH_COLUMN), $existingDepartments) as $availableDepartment) {
-                $eligible[normalize_person_key((string) $availableDepartment)] = (string) $availableDepartment;
-            }
-            foreach ($departments as &$department) {
-                $key = normalize_person_key($department);
-                if (!isset($eligible[$key])) {
-                    db()->rollBack();
-                    json_response(['error' => 'Solo se pueden programar departamentos registrados en Activos con equipos vigentes. No se aceptan nombres inventados.'], 422);
-                }
-                $department = $eligible[$key];
-            }
-            unset($department);
-            $departments = array_values(array_unique($departments));
-
-            $wanted = array_fill_keys($departments, true);
-            foreach ($currentRows as $row) {
-                $department = (string) $row['department'];
-                if ((int) $row['is_active'] && !isset($wanted[$department])) {
-                    $requestQuery = db()->prepare('SELECT id,status FROM maintenance_department_requests WHERE plan_id=? FOR UPDATE');
-                    $requestQuery->execute([(int) $row['id']]);
-                    $request = $requestQuery->fetch();
-                    if ($request && $request['status'] === 'confirmed') {
-                        $activeServices = db()->prepare('SELECT COUNT(*) FROM maintenance_department_request_services s JOIN maintenance m ON m.id=s.maintenance_id WHERE s.request_id=? AND m.status IN ("pending","confirmed","reschedule_requested")');
-                        $activeServices->execute([(int) $request['id']]);
-                        if ((int) $activeServices->fetchColumn() > 0) {
-                            db()->rollBack();
-                            json_response(['error' => 'Cancela o termina primero los servicios confirmados de ' . $department . ' antes de retirarlo del mes.'], 409);
-                        }
-                    }
-                    db()->prepare('UPDATE maintenance_department_plans SET is_active=0,updated_by=? WHERE id=?')->execute([(int) $user['id'], (int) $row['id']]);
-                    db()->prepare('INSERT INTO maintenance_department_plan_history (plan_id,plan_year,plan_month,department,action,previous_email,recipient_email,changed_by) VALUES (?,?,?,?,"removed",?,?,?)')
-                        ->execute([(int) $row['id'], $year, $month, $department, $row['recipient_email'], $row['recipient_email'], (int) $user['id']]);
-                    if ($request && $request['status'] === 'email_sent') {
-                        db()->prepare('UPDATE maintenance_department_requests SET status="cancelled" WHERE id=?')->execute([(int) $request['id']]);
-                        db()->prepare('UPDATE maintenance_department_request_tokens SET status="revoked" WHERE request_id=? AND status IN ("sent","sending")')->execute([(int) $request['id']]);
-                        append_department_request_event((int) $request['id'], 'plan_removed', 'Se retiró el departamento del mes antes de confirmar la solicitud.', (int) $user['id']);
-                    }
-                }
-            }
-
-            foreach ($departments as $department) {
-                $existing = $currentByDepartment[$department] ?? null;
-                if ($existing) {
-                    if (!(int) $existing['is_active']) {
-                        db()->prepare('UPDATE maintenance_department_plans SET is_active=1,updated_by=? WHERE id=?')->execute([(int) $user['id'], (int) $existing['id']]);
-                        db()->prepare('INSERT INTO maintenance_department_plan_history (plan_id,plan_year,plan_month,department,action,previous_email,recipient_email,changed_by) VALUES (?,?,?,?,"added",?,?,?)')
-                            ->execute([(int) $existing['id'], $year, $month, $department, $existing['recipient_email'], $existing['recipient_email'], (int) $user['id']]);
-                        $request = db()->prepare('SELECT id,status FROM maintenance_department_requests WHERE plan_id=?');
-                        $request->execute([(int) $existing['id']]);
-                        $requestRow = $request->fetch();
-                        if ($requestRow && $requestRow['status'] === 'cancelled') db()->prepare('UPDATE maintenance_department_requests SET status="notification_pending" WHERE id=?')->execute([(int) $requestRow['id']]);
-                    }
-                    continue;
-                }
-                db()->prepare('INSERT INTO maintenance_department_plans (plan_year,plan_month,department,created_by,updated_by) VALUES (?,?,?,?,?)')
-                    ->execute([$year, $month, $department, (int) $user['id'], (int) $user['id']]);
-                $planId = (int) db()->lastInsertId();
-                db()->prepare('INSERT INTO maintenance_department_plan_history (plan_id,plan_year,plan_month,department,action,changed_by) VALUES (?,?,?,? ,"added",?)')
-                    ->execute([$planId, $year, $month, $department, (int) $user['id']]);
-            }
-            db()->commit();
-        } catch (Throwable $error) {
-            if (db()->inTransaction()) db()->rollBack();
-            throw $error;
-        }
-        json_response(['ok' => true]);
+        if ($year < 2026 || $year > 2200) json_response(['error' => 'Año inválido.'], 422);
+        $field = static fn (string $key, int $max): string => mb_substr(trim((string) ($data[$key] ?? '')), 0, $max);
+        $revision = $field('revision', 20);
+        if ($revision === '') json_response(['error' => 'La revisión es obligatoria.'], 422);
+        db()->prepare('INSERT INTO maintenance_program_meta (plan_year, revision, issue_date, revision_date, updated_by_name, updated_on) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE revision=VALUES(revision), issue_date=VALUES(issue_date), revision_date=VALUES(revision_date), updated_by_name=VALUES(updated_by_name), updated_on=VALUES(updated_on)')
+            ->execute([$year, $revision, $field('issue_date', 60), $field('revision_date', 60), $field('updated_by_name', 140), $field('updated_on', 60)]);
+        json_response(['ok' => true, 'message' => 'Encabezado del programa ' . $year . ' actualizado.']);
     }
 
-    if ($action === 'maintenance-department-notify' && $method === 'POST') {
+    if ($action === 'maintenance-program-generate' && $method === 'POST') {
         require_role(['admin']);
-        $planId = (int) ($data['planId'] ?? 0);
-        $recipient = trim((string) ($data['recipientEmail'] ?? ''));
-        $explicitResend = !empty($data['resend']);
-        if (!filter_var($recipient, FILTER_VALIDATE_EMAIL) || mb_strlen($recipient) > 190) {
-            json_response(['error' => 'Ingresa y revisa el correo real del destinatario antes de enviar.'], 422);
-        }
-        if (empty($config['smtp']['host']) || empty($config['smtp']['username']) || empty($config['smtp']['password']) || empty($config['smtp']['from_email']) || !is_file(__DIR__ . '/../vendor/autoload.php')) {
-            json_response(['error' => 'No se envió el correo: configura Gmail SMTP y PHPMailer en el entorno local.'], 503);
-        }
-        $rawToken = bin2hex(random_bytes(32));
-        $tokenHash = hash('sha256', $rawToken);
-        $mailAssets = [];
-        $requestId = 0;
-        $tokenId = 0;
-        $plan = null;
+        $year = (int) ($data['year'] ?? 0);
+        if ($year < 2000 || $year > 2200) json_response(['error' => 'Año inválido.'], 422);
+        $assets = db()->query("SELECT asset_tag AS tag, TRIM(CONCAT(COALESCE(brand,''),' ',COALESCE(model,''))) AS model, COALESCE(serial_number,'') AS serial, UPPER(TRIM(COALESCE(department,''))) AS department, COALESCE(monitor,'') AS monitor FROM assets WHERE type='computer' AND status<>'retired' ORDER BY asset_tag")->fetchAll();
+        if (!$assets) json_response(['error' => 'No hay equipos activos en el inventario.'], 422);
+        require_once __DIR__ . '/../app/xlsx_program.php';
+        $plan = plan_maintenance_program($assets);
         db()->beginTransaction();
         try {
-            $planQuery = db()->prepare('SELECT id,plan_year,plan_month,department,recipient_email FROM maintenance_department_plans WHERE id=? AND is_active=1 FOR UPDATE');
-            $planQuery->execute([$planId]);
-            $plan = $planQuery->fetch();
-            if (!$plan) {
-                db()->rollBack();
-                json_response(['error' => 'El departamento ya no está incluido en el programa.'], 404);
+            db()->prepare('DELETE FROM maintenance_program_items WHERE plan_year=?')->execute([$year]);
+            $insert = db()->prepare('INSERT INTO maintenance_program_items (plan_year, seq, model, serial_number, asset_tag, department, monitor_code, planned_months, created_by) VALUES (?,?,?,?,?,?,?,?,?)');
+            foreach ($plan as $item) {
+                $insert->execute([$year, $item['seq'], mb_substr($item['model'], 0, 140), mb_substr($item['serial'], 0, 120), mb_substr($item['tag'], 0, 60), mb_substr($item['department'], 0, 140), mb_substr($item['monitor'], 0, 60), implode(',', $item['months']), (int) $user['id']]);
             }
-            $details = department_assets((string) $plan['department']);
-            if (!$details['assets']) {
-                db()->rollBack();
-                json_response(['error' => 'El departamento ya no tiene equipos vigentes en Activos. Actualiza la planificación.'], 409);
-            }
-            $requestQuery = db()->prepare('SELECT id,status FROM maintenance_department_requests WHERE plan_id=? FOR UPDATE');
-            $requestQuery->execute([$planId]);
-            $request = $requestQuery->fetch();
-            if ($request && $request['status'] === 'confirmed') {
-                db()->rollBack();
-                json_response(['error' => 'Esta solicitud ya fue confirmada y programó los equipos.'], 409);
-            }
-            if ($request) {
-                $latestQuery = db()->prepare('SELECT id,status,created_at FROM maintenance_department_request_tokens WHERE request_id=? ORDER BY id DESC LIMIT 1 FOR UPDATE');
-                $latestQuery->execute([(int) $request['id']]);
-                $latest = $latestQuery->fetch();
-                if ($latest && $latest['status'] === 'sending' && strtotime((string) $latest['created_at']) > time() - 600) {
-                    db()->rollBack();
-                    json_response(['error' => 'Ya hay un envío en curso para este departamento. Espera su resultado antes de reintentar.'], 409);
-                }
-                if ($request['status'] === 'email_sent' && !$explicitResend) {
-                    db()->rollBack();
-                    json_response(['error' => 'La invitación ya se envió. Usa Reenviar para revocar el enlace anterior y emitir uno nuevo.'], 409);
-                }
-                $requestId = (int) $request['id'];
-                db()->prepare('UPDATE maintenance_department_request_tokens SET status="failed",failure_message="El envío anterior no finalizó" WHERE request_id=? AND status="sending" AND created_at<=DATE_SUB(NOW(),INTERVAL 10 MINUTE)')->execute([$requestId]);
-                db()->prepare('UPDATE maintenance_department_request_tokens SET status="revoked" WHERE request_id=? AND status="sent"')->execute([$requestId]);
-                db()->prepare('UPDATE maintenance_department_requests SET status="notification_pending",recipient_email=? WHERE id=?')->execute([$recipient, $requestId]);
-            } else {
-                db()->prepare('INSERT INTO maintenance_department_requests (plan_id,status,recipient_email,created_by) VALUES (?,"notification_pending",?,?)')
-                    ->execute([$planId, $recipient, (int) $user['id']]);
-                $requestId = (int) db()->lastInsertId();
-            }
-            if (($plan['recipient_email'] ?? '') !== $recipient) {
-                db()->prepare('UPDATE maintenance_department_plans SET recipient_email=?,updated_by=? WHERE id=?')->execute([$recipient, (int) $user['id'], $planId]);
-                db()->prepare('INSERT INTO maintenance_department_plan_history (plan_id,plan_year,plan_month,department,action,previous_email,recipient_email,changed_by) VALUES (?,?,?, ?,"recipient_updated",?,?,?)')
-                    ->execute([$planId, (int) $plan['plan_year'], (int) $plan['plan_month'], $plan['department'], $plan['recipient_email'], $recipient, (int) $user['id']]);
-            }
-            db()->prepare('INSERT INTO maintenance_department_request_tokens (request_id,token_hash,recipient_email,expires_at,status,created_by) VALUES (?,?,?,?,"sending",?)')
-                ->execute([$requestId, $tokenHash, $recipient, (new DateTimeImmutable('+14 days'))->format('Y-m-d H:i:s'), (int) $user['id']]);
-            $tokenId = (int) db()->lastInsertId();
-            $insertItem = db()->prepare('INSERT INTO maintenance_department_request_assets (request_id,token_id,asset_id,asset_tag_snapshot,assigned_people_snapshot) VALUES (?,?,?,?,?)');
-            foreach ($details['assets'] as $asset) {
-                $assignedNames = $asset['assigned_people'] ?: ['Sin persona asignada en Activos'];
-                $insertItem->execute([$requestId, $tokenId, (int) $asset['id'], $asset['asset_tag'], implode('; ', $assignedNames)]);
-                $mailAssets[] = $asset + ['assigned_people' => $assignedNames];
-            }
-            append_department_request_event($requestId, $explicitResend ? 'notification_resent' : 'notification_prepared', count($mailAssets) . ' equipos; destinatario revisado: ' . $recipient . '.', (int) $user['id']);
             db()->commit();
         } catch (Throwable $error) {
             if (db()->inTransaction()) db()->rollBack();
             throw $error;
         }
+        json_response(['ok' => true, 'count' => count($plan), 'message' => 'Programa ' . $year . ' generado con ' . count($plan) . ' equipos, agrupados por departamento.']);
+    }
 
-        $inviteUrl = rtrim((string) $config['app_url'], '/') . '/respond.php?token=' . rawurlencode($rawToken);
-        $mailResult = send_department_maintenance_email($plan, $mailAssets, $recipient, $inviteUrl);
-        if ($mailResult['sent']) {
-            db()->prepare('UPDATE maintenance_department_request_tokens SET status="sent",sent_at=NOW() WHERE id=? AND status="sending"')->execute([$tokenId]);
-            db()->prepare('UPDATE maintenance_department_requests SET status="email_sent",recipient_email=? WHERE id=? AND status="notification_pending"')->execute([$recipient, $requestId]);
-            append_department_request_event($requestId, 'email_accepted', 'Gmail SMTP aceptó el mensaje para ' . $recipient . '.', (int) $user['id']);
-            json_response(['ok' => true, 'emailSent' => true, 'message' => 'Gmail SMTP aceptó el correo. La entrega final depende del servicio de correo del destinatario.']);
+    if ($action === 'maintenance-program-import' && $method === 'POST') {
+        require_role(['admin']);
+        $year = (int) ($_POST['year'] ?? 0);
+        if ($year < 2000 || $year > 2200) json_response(['error' => 'Año inválido.'], 422);
+        $upload = $_FILES['program'] ?? null;
+        if (!is_array($upload) || ($upload['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK || !is_uploaded_file((string) $upload['tmp_name'])) {
+            json_response(['error' => 'Selecciona el archivo Excel (.xlsx) del programa.'], 422);
         }
-        db()->prepare('UPDATE maintenance_department_request_tokens SET status="failed",failure_message=? WHERE id=? AND status="sending"')->execute([$mailResult['message'], $tokenId]);
-        db()->prepare('UPDATE maintenance_department_requests SET status="notification_pending" WHERE id=?')->execute([$requestId]);
-        append_department_request_event($requestId, 'email_failed', 'No se confirmó el envío por SMTP.', (int) $user['id']);
-        json_response(['ok' => true, 'emailSent' => false, 'message' => $mailResult['message']]);
+        if ((int) $upload['size'] > 10 * 1024 * 1024) json_response(['error' => 'El archivo supera 10 MB.'], 422);
+        require_once __DIR__ . '/../app/xlsx_program.php';
+        try {
+            $items = xlsx_parse_maintenance_program((string) file_get_contents($upload['tmp_name']));
+        } catch (Throwable $error) {
+            json_response(['error' => $error instanceof RuntimeException ? $error->getMessage() : 'No se pudo leer el Excel. Verifica que sea .xlsx.'], 422);
+        }
+        db()->beginTransaction();
+        try {
+            db()->prepare('DELETE FROM maintenance_program_items WHERE plan_year=?')->execute([$year]);
+            $insert = db()->prepare('INSERT INTO maintenance_program_items (plan_year, seq, model, serial_number, asset_tag, department, monitor_code, planned_months, created_by) VALUES (?,?,?,?,?,?,?,?,?)');
+            foreach ($items as $item) {
+                $insert->execute([$year, $item['seq'], $item['model'], $item['serial'], $item['tag'], $item['department'], $item['monitor'], implode(',', $item['months']), (int) $user['id']]);
+            }
+            db()->commit();
+        } catch (Throwable $error) {
+            if (db()->inTransaction()) db()->rollBack();
+            throw $error;
+        }
+        json_response(['ok' => true, 'count' => count($items), 'message' => count($items) . ' equipos importados al programa ' . $year . '.']);
     }
 
     if ($action === 'dashboard' && $method === 'GET') {
@@ -684,6 +420,23 @@ try {
             'laptops' => (int) db()->query('SELECT COUNT(*) FROM assets WHERE type="computer" AND UPPER(asset_tag) LIKE "RAS-LT%" AND status<>"retired"')->fetchColumn(),
             'maintenance' => (int) db()->query('SELECT COUNT(*) FROM maintenance WHERE status IN ("pending", "confirmed", "reschedule_requested")')->fetchColumn(),
         ];
+        $monthNow = (int) date('n');
+        $yearNow = (int) date('Y');
+        $monthTags = [];
+        $programRows = db()->prepare('SELECT asset_tag, planned_months FROM maintenance_program_items WHERE plan_year=?');
+        $programRows->execute([$yearNow]);
+        foreach ($programRows->fetchAll() as $row) {
+            if (in_array($monthNow, array_map('intval', explode(',', (string) $row['planned_months'])), true)) $monthTags[strtoupper(trim((string) $row['asset_tag']))] = false;
+        }
+        $doneRows = db()->prepare('SELECT a.asset_tag FROM responsibility_documents d JOIN assets a ON a.id=d.asset_id WHERE d.form_type="service_order" AND d.performed_by_signed_at IS NOT NULL AND YEAR(COALESCE(d.performed_by_signed_at, d.signed_at, d.created_at))=? AND MONTH(COALESCE(d.performed_by_signed_at, d.signed_at, d.created_at))=? UNION SELECT a.asset_tag FROM maintenance m JOIN assets a ON a.id=m.asset_id WHERE m.status="completed" AND YEAR(m.completed_at)=? AND MONTH(m.completed_at)=?');
+        $doneRows->execute([$yearNow, $monthNow, $yearNow, $monthNow]);
+        foreach ($doneRows->fetchAll(PDO::FETCH_COLUMN) as $tag) {
+            $key = strtoupper(trim((string) $tag));
+            if (array_key_exists($key, $monthTags)) $monthTags[$key] = true;
+        }
+        $counts['month_planned'] = count($monthTags);
+        $counts['month_done'] = count(array_filter($monthTags));
+        $counts['month_pending'] = $counts['month_planned'] - $counts['month_done'];
         $next = db()->query('SELECT m.id, m.scheduled_at, m.status, a.asset_tag, a.brand, a.model, u.name AS user_name FROM maintenance m JOIN assets a ON a.id = m.asset_id JOIN users u ON u.id = m.user_id WHERE m.status IN ("pending", "confirmed", "reschedule_requested") ORDER BY m.scheduled_at LIMIT 6')->fetchAll();
         json_response(['counts' => $counts, 'upcoming' => $next, 'charts' => dashboard_charts()]);
     }
@@ -1067,32 +820,24 @@ try {
         $phoneCategory = in_array($data['phoneCategory'] ?? '', ['administrative', 'operational'], true)
             ? $data['phoneCategory']
             : ($existingAsset['phone_category'] ?? null);
-        $assignedUserIds = is_array($data['assignedUserIds'] ?? null)
-            ? array_values(array_unique(array_filter(array_map('intval', $data['assignedUserIds']), static fn (int $id): bool => $id > 0)))
-            : (!empty($data['assignedUserId']) ? [(int) $data['assignedUserId']] : []);
-        if (count($assignedUserIds) > 5) {
+        $assigneeNames = [];
+        foreach (is_array($data['assigneeNames'] ?? null) ? $data['assigneeNames'] : [] as $rawName) {
+            $personName = clean_text($rawName, 140);
+            if ($personName !== '' && !in_array($personName, $assigneeNames, true)) $assigneeNames[] = $personName;
+        }
+        if (count($assigneeNames) > 5) {
             json_response(['error' => 'Un equipo puede tener hasta cinco personas asignadas.'], 422);
         }
-        if ($assignedUserIds) {
-            $userPlaceholders = implode(',', array_fill(0, count($assignedUserIds), '?'));
-            $usersStatement = db()->prepare("SELECT COUNT(*) FROM users WHERE id IN ({$userPlaceholders})");
-            $usersStatement->execute($assignedUserIds);
-            if ((int) $usersStatement->fetchColumn() !== count($assignedUserIds)) {
-                json_response(['error' => 'Una o más personas seleccionadas no existen.'], 422);
-            }
+        $assignedUserIds = [];
+        $assigneeUsers = [];
+        $userLookup = db()->prepare('SELECT id, name, department FROM users WHERE UPPER(TRIM(name))=UPPER(?) LIMIT 1');
+        foreach ($assigneeNames as $personName) {
+            $userLookup->execute([$personName]);
+            $matchedUser = $userLookup->fetch();
+            $assigneeUsers[$personName] = $matchedUser ?: null;
+            if ($matchedUser) $assignedUserIds[] = (int) $matchedUser['id'];
         }
         $assignedDate = null;
-        if ($assignedUserIds) {
-            $assignedDate = trim((string) ($data['assignedDate'] ?? ''));
-            if ($assignedDate !== '') {
-                $parsedAssignedDate = DateTimeImmutable::createFromFormat('!Y-m-d', $assignedDate);
-                if (!$parsedAssignedDate || $parsedAssignedDate->format('Y-m-d') !== $assignedDate) {
-                    json_response(['error' => 'Ingresa una fecha de asignación válida.'], 422);
-                }
-            } else {
-                $assignedDate = null;
-            }
-        }
         if ($type === 'phone' && ($phoneFormatStatus === null || $phoneCategory === null)) {
             json_response(['error' => 'Selecciona el estado y la categoría del celular.'], 422);
         }
@@ -1146,7 +891,7 @@ try {
             $assignedUserIds[0] ?? null,
             $assignedDate,
             clean_text($data['department'] ?? '', 140),
-            clean_text($data['terminal'] ?? '', 190),
+            'ARTEAGA',
             clean_text($data['position'] ?? '', 140),
             clean_text($data['monitor'] ?? '', 160),
             clean_text($data['mouse'] ?? '', 160),
@@ -1155,7 +900,7 @@ try {
             $warrantyUntil !== '' ? $warrantyUntil : null,
             clean_text($data['antivirusProduct'] ?? '', 160),
             $antivirusExpiresOn !== '' ? $antivirusExpiresOn : null,
-            clean_text($data['sourceAssigneeName'] ?? '', 140),
+            implode('; ', $assigneeNames),
             clean_text($data['notes'] ?? '', 2000),
         ];
         if ($fields[0] === '' || $fields[2] === '' || $fields[3] === '') {
@@ -1164,7 +909,7 @@ try {
         db()->beginTransaction();
         try {
             if ($id) {
-                $statement = db()->prepare('UPDATE assets SET asset_tag=?, type=?, brand=?, model=?, serial_number=?, windows_username=?, status=?, phone_format_status=?, phone_category=?, assigned_user_id=?, assigned_date=?, department=?, terminal=?, job_title=?, monitor=?, mouse=?, rdp_access=?, purchase_date=?, warranty_until=?, antivirus_product=?, antivirus_expires_on=?, source_assignee_name=COALESCE(NULLIF(?, ""), source_assignee_name), notes=?, windows_password=?, windows_password_ciphertext=NULL WHERE id=?');
+                $statement = db()->prepare('UPDATE assets SET asset_tag=?, type=?, brand=?, model=?, serial_number=?, windows_username=?, status=?, phone_format_status=?, phone_category=?, assigned_user_id=?, assigned_date=COALESCE(?, assigned_date), department=?, terminal=?, job_title=?, monitor=?, mouse=?, rdp_access=?, purchase_date=?, warranty_until=?, antivirus_product=?, antivirus_expires_on=?, source_assignee_name=?, notes=?, windows_password=?, windows_password_ciphertext=NULL WHERE id=?');
                 $statement->execute([...$fields, $windowsPasswordToSave, $id]);
                 $assetId = $id;
             } else {
@@ -1172,22 +917,25 @@ try {
                 $statement->execute([...$fields, $windowsPasswordToSave]);
                 $assetId = (int) db()->lastInsertId();
             }
-            $previousDatesStatement = db()->prepare('SELECT user_id, assigned_date FROM asset_users WHERE asset_id=?');
-            $previousDatesStatement->execute([$assetId]);
-            $previousDates = array_column($previousDatesStatement->fetchAll(), 'assigned_date', 'user_id');
+            $existingStatement = db()->prepare('SELECT person_name, assigned_date FROM asset_assignees WHERE asset_id=?');
+            $existingStatement->execute([$assetId]);
+            $existingDates = array_column($existingStatement->fetchAll(), 'assigned_date', 'person_name');
+            if ($assigneeNames) {
+                $keepPlaceholders = implode(',', array_fill(0, count($assigneeNames), '?'));
+                db()->prepare("DELETE FROM asset_assignees WHERE asset_id=? AND person_name NOT IN ({$keepPlaceholders})")->execute([$assetId, ...$assigneeNames]);
+            } else {
+                db()->prepare('DELETE FROM asset_assignees WHERE asset_id=?')->execute([$assetId]);
+            }
             db()->prepare('DELETE FROM asset_users WHERE asset_id=?')->execute([$assetId]);
-            db()->prepare('DELETE FROM asset_assignees WHERE asset_id=? AND user_id IS NOT NULL')->execute([$assetId]);
             $assignmentInsert = db()->prepare('INSERT INTO asset_users (asset_id, user_id, assigned_date) VALUES (?, ?, ?)');
-            $personStatement = db()->prepare('SELECT name, department FROM users WHERE id=?');
-            $assigneeInsert = db()->prepare('INSERT INTO asset_assignees (asset_id, user_id, person_name, department, assigned_date) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id=VALUES(user_id), department=VALUES(department), assigned_date=VALUES(assigned_date)');
-            foreach ($assignedUserIds as $assignedUserId) {
-                $personAssignedDate = $assignedDate ?? ($previousDates[$assignedUserId] ?? date('Y-m-d'));
-                $assignmentInsert->execute([$assetId, $assignedUserId, $personAssignedDate]);
-                $personStatement->execute([$assignedUserId]);
-                $person = $personStatement->fetch();
-                if ($person) {
-                    $assigneeInsert->execute([$assetId, $assignedUserId, $person['name'], $person['department'], $personAssignedDate]);
+            $assigneeInsert = db()->prepare('INSERT INTO asset_assignees (asset_id, user_id, person_name, department, assigned_date) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id=VALUES(user_id)');
+            foreach ($assigneeNames as $personName) {
+                $matchedUser = $assigneeUsers[$personName] ?? null;
+                $personAssignedDate = $existingDates[$personName] ?? date('Y-m-d');
+                if ($matchedUser) {
+                    $assignmentInsert->execute([$assetId, (int) $matchedUser['id'], $personAssignedDate]);
                 }
+                $assigneeInsert->execute([$assetId, $matchedUser ? (int) $matchedUser['id'] : null, $personName, $matchedUser['department'] ?? (clean_text($data['department'] ?? '', 140) ?: null), $personAssignedDate]);
             }
             db()->commit();
         } catch (Throwable $error) {
@@ -1378,15 +1126,21 @@ try {
         unset($maintenance);
         $year = (int) ($_GET['year'] ?? date('Y'));
         if ($year < 2000 || $year > 2200) $year = (int) date('Y');
-        $progressSql = 'SELECT a.id AS asset_id, a.asset_tag, a.brand, a.model, COUNT(m.id) AS completed_count FROM assets a LEFT JOIN maintenance m ON m.asset_id=a.id AND m.status="completed" AND YEAR(COALESCE(m.completed_at,m.scheduled_at))=? WHERE a.type="computer" AND a.status<>"retired"';
+        $progressSql = 'SELECT a.id AS asset_id, a.asset_tag, a.brand, a.model, d.id AS doc_id, COALESCE(d.performed_by_signed_at, d.signed_at, d.created_at) AS done_at FROM responsibility_documents d JOIN assets a ON a.id=d.asset_id WHERE d.form_type="service_order" AND d.performed_by_signed_at IS NOT NULL AND YEAR(COALESCE(d.performed_by_signed_at, d.signed_at, d.created_at))=?';
         $progressSql .= $user['role'] === 'user' ? ' AND EXISTS (SELECT 1 FROM asset_users au WHERE au.asset_id=a.id AND au.user_id=?)' : '';
-        $progressSql .= ' GROUP BY a.id, a.asset_tag, a.brand, a.model ORDER BY a.asset_tag';
+        $progressSql .= ' ORDER BY a.asset_tag, done_at, d.id';
         $progressQuery = db()->prepare($progressSql);
         $progressQuery->execute($user['role'] === 'user' ? [$year, $user['id']] : [$year]);
+        $byAsset = [];
+        foreach ($progressQuery->fetchAll() as $row) {
+            $id = (int) $row['asset_id'];
+            $byAsset[$id] ??= ['asset_id' => $id, 'asset_tag' => $row['asset_tag'], 'brand' => $row['brand'], 'model' => $row['model'], 'forms' => []];
+            $byAsset[$id]['forms'][] = ['id' => (int) $row['doc_id'], 'done_at' => $row['done_at']];
+        }
         $annualProgress = array_map(static function (array $asset): array {
-            $asset['completed_count'] = min(2, (int) $asset['completed_count']);
+            $asset['completed_count'] = min(2, count($asset['forms']));
             return $asset;
-        }, $progressQuery->fetchAll());
+        }, array_values($byAsset));
         json_response(['maintenances' => $maintenances, 'annualProgress' => $annualProgress, 'year' => $year]);
     }
 
@@ -1401,7 +1155,7 @@ try {
         if ($personName === '') {
             json_response(['error' => 'Selecciona una persona asignada al equipo.'], 422);
         }
-        $assetQuery = db()->prepare('SELECT id, source_assignee_name FROM assets WHERE id=? AND type="computer" AND status<>"retired"');
+        $assetQuery = db()->prepare('SELECT id, asset_tag, brand, model, source_assignee_name FROM assets WHERE id=? AND type="computer" AND status<>"retired"');
         $assetQuery->execute([$assetId]);
         $asset = $assetQuery->fetch();
         if (!$asset) {
@@ -1434,7 +1188,6 @@ try {
         if (!$scheduledDate) {
             json_response(['error' => 'Elige un horario futuro disponible entre 8:30 a. m. y 5:00 p. m., en intervalos de 30 minutos.'], 422);
         }
-        $token = bin2hex(random_bytes(32));
         $scheduledAt = $scheduledDate->format('Y-m-d H:i:s');
         $serviceNotes = clean_text($data['notes'] ?? '', 2000);
         $savedNotes = json_encode([
@@ -1442,6 +1195,7 @@ try {
             'person_name' => $personName,
             'service_notes' => $serviceNotes,
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $token = bin2hex(random_bytes(32));
         db()->beginTransaction();
         try {
             $assetLock = db()->prepare('SELECT id FROM assets WHERE id=? FOR UPDATE');
@@ -1450,7 +1204,7 @@ try {
                 db()->rollBack();
                 json_response(['error' => 'No se encontró el equipo seleccionado.'], 404);
             }
-            $stmt = db()->prepare('INSERT INTO maintenance (asset_id, user_id, technician_id, scheduled_at, status, invite_token_hash, notes) VALUES (?, ?, ?, ?, "confirmed", ?, ?)');
+            $stmt = db()->prepare('INSERT INTO maintenance (asset_id, user_id, technician_id, scheduled_at, status, invite_token_hash, notes) VALUES (?, ?, ?, ?, "pending", ?, ?)');
             $stmt->execute([$assetId, $user['id'], $user['id'], $scheduledAt, hash('sha256', $token), $savedNotes]);
             db()->commit();
         } catch (Throwable $error) {
@@ -1460,7 +1214,40 @@ try {
             if (is_duplicate_slot_error($error)) json_response(['error' => 'Ese horario acaba de ocuparse. Actualiza la disponibilidad y elige otro.'], 409);
             throw $error;
         }
-        json_response(['ok' => true, 'message' => 'Servicio guardado en la agenda.']);
+
+        $recipientQuery = db()->prepare('SELECT DISTINCT u.name, u.email FROM users u WHERE u.id IN (SELECT user_id FROM asset_users WHERE asset_id=? UNION SELECT assigned_user_id FROM assets WHERE id=? AND assigned_user_id IS NOT NULL)');
+        $recipientQuery->execute([$assetId, $assetId]);
+        $recipientEmails = [];
+        foreach ($recipientQuery->fetchAll() as $candidate) {
+            if (normalize_person_key((string) $candidate['name']) === normalize_person_key($personName)) {
+                $email = filter_var($candidate['email'], FILTER_VALIDATE_EMAIL);
+                if ($email) $recipientEmails[(string) $email] = ['email' => (string) $email, 'name' => (string) $candidate['name']];
+            }
+        }
+
+        $inviteUrl = rtrim((string) $config['app_url'], '/') . '/respond.php?token=' . rawurlencode($token);
+        $date = (new DateTimeImmutable($scheduledAt))->format('d/m/Y H:i');
+        $assetLabel = trim((string) $asset['asset_tag'] . ' · ' . (string) $asset['brand'] . ' ' . (string) $asset['model']);
+        $manualInvitation = "Hola {$personName}:\nSe programó el mantenimiento de {$assetLabel} para el {$date}.\nConfirma el horario o propone otro desde este enlace:\n{$inviteUrl}";
+        if (count($recipientEmails) === 1) {
+            $recipient = reset($recipientEmails);
+            $emailResult = send_maintenance_invitation_email($recipient['email'], $recipient['name'], $asset, $scheduledAt, $inviteUrl);
+        } else {
+            $message = $recipientEmails
+                ? 'No se envió el correo: hay más de una cuenta coincidente. Comparte la invitación manualmente.'
+                : 'No se envió el correo: la persona no tiene un correo asociado en Activos. Comparte la invitación manualmente.';
+            $emailResult = ['sent' => false, 'message' => $message];
+        }
+        if ($emailResult['sent']) {
+            db()->prepare('UPDATE maintenance SET invitation_sent_at=NOW() WHERE invite_token_hash=?')->execute([hash('sha256', $token)]);
+        }
+        json_response([
+            'ok' => true,
+            'message' => $emailResult['sent'] ? 'Invitación enviada por correo.' : 'Servicio agendado; comparte la invitación manualmente.',
+            'emailSent' => $emailResult['sent'],
+            'emailMessage' => $emailResult['message'],
+            'manualInvitation' => $manualInvitation,
+        ]);
     }
 
     if ($action === 'maintenance-reschedule' && $method === 'POST') {
@@ -1483,7 +1270,6 @@ try {
             $newDateString = $newDate->format('Y-m-d H:i:s');
             db()->prepare('UPDATE maintenance SET scheduled_at=?, proposed_at=NULL, status=CASE WHEN status="reschedule_requested" THEN "confirmed" ELSE status END WHERE id=?')
                 ->execute([$newDateString, $id]);
-            append_linked_maintenance_event($id, 'maintenance_rescheduled', 'Servicio reprogramado de ' . $oldDate . ' a ' . $newDateString . '.', (int) $user['id']);
             db()->prepare('INSERT INTO asset_history (asset_id, event_type, component, details, occurred_at, created_by) VALUES (?, "other", "Reprogramación de mantenimiento", ?, ?, ?)')
                 ->execute([(int) $record['asset_id'], 'Servicio #' . $id . ' reprogramado de ' . $oldDate . ' a ' . $newDateString . '.', $newDate->format('Y-m-d 00:00:00'), $user['id']]);
             db()->commit();
@@ -1508,7 +1294,6 @@ try {
                 json_response(['error' => 'No se encontró un servicio activo para cancelar.'], 409);
             }
             db()->prepare('UPDATE maintenance SET status="cancelled", proposed_at=NULL WHERE id=?')->execute([$id]);
-            append_linked_maintenance_event($id, 'maintenance_cancelled', 'Servicio cancelado; el horario quedó disponible.', (int) $user['id']);
             db()->prepare('INSERT INTO asset_history (asset_id, event_type, component, details, occurred_at, created_by) VALUES (?, "other", "Cancelación de mantenimiento", ?, NOW(), ?)')
                 ->execute([(int) $record['asset_id'], 'Se canceló el servicio #' . $id . ' programado para ' . (string) ($record['proposed_at'] ?: $record['scheduled_at']) . '.', $user['id']]);
             db()->commit();
@@ -1528,7 +1313,6 @@ try {
         if (!$maintenance || !$maintenance['proposed_at'] || !parse_maintenance_slot(date('Y-m-d H:i', strtotime($maintenance['proposed_at'])))) {
             json_response(['error' => 'La propuesta ya no está disponible o su horario ya pasó.'], 409);
         }
-        $token = bin2hex(random_bytes(32));
         db()->beginTransaction();
         try {
             $assetLock = db()->prepare('SELECT id FROM assets WHERE id=? FOR UPDATE');
@@ -1547,9 +1331,8 @@ try {
             }
             db()->prepare('INSERT INTO asset_history (asset_id, event_type, component, details, occurred_at, created_by) VALUES (?, "other", "Reprogramacion de mantenimiento", ?, NOW(), ?)')
                 ->execute([(int) $maintenance['asset_id'], 'Servicio #' . $id . ' reprogramado de ' . (string) $lockedMaintenance['scheduled_at'] . ' a ' . (string) $currentProposal . '.', $user['id']]);
-            db()->prepare('UPDATE maintenance SET scheduled_at=?, proposed_at=NULL, status="confirmed", invite_token_hash=?, invitation_sent_at=NULL WHERE id=? AND status="reschedule_requested"')
-                ->execute([$currentProposal, hash('sha256', $token), $id]);
-            append_linked_maintenance_event($id, 'maintenance_rescheduled', 'Propuesta aceptada para ' . (string) $currentProposal . '.', (int) $user['id']);
+            db()->prepare('UPDATE maintenance SET scheduled_at=?, proposed_at=NULL, status="confirmed" WHERE id=? AND status="reschedule_requested"')
+                ->execute([$currentProposal, $id]);
             db()->commit();
             $maintenance['proposed_at'] = $currentProposal;
         } catch (Throwable $error) {
@@ -1559,8 +1342,7 @@ try {
             if (is_duplicate_slot_error($error)) json_response(['error' => 'Ese horario acaba de ocuparse. No se pudo aprobar la reprogramación.'], 409);
             throw $error;
         }
-        $mailResult = send_maintenance_email((int) $maintenance['user_id'], (int) $maintenance['asset_id'], $maintenance['proposed_at'], $token);
-        json_response(['ok' => true, 'emailSent' => $mailResult['sent'], 'emailMessage' => $mailResult['message'], 'inviteUrl' => $mailResult['sent'] ? null : $config['app_url'] . '/respond.php?token=' . rawurlencode($token)]);
+        json_response(['ok' => true]);
     }
 
     if ($action === 'maintenance-complete' && $method === 'POST') {
@@ -1576,7 +1358,6 @@ try {
         if (!$statement->rowCount()) {
             json_response(['error' => 'No se encontró un mantenimiento pendiente para cerrar.'], 404);
         }
-        append_linked_maintenance_event($id, 'maintenance_completed', 'El mantenimiento quedó completado y firmado.', (int) $user['id']);
         json_response(['ok' => true]);
     }
 
@@ -1640,6 +1421,31 @@ try {
         exit;
     }
 
+    if ($action === 'technician-signatures' && $method === 'GET') {
+        require_role(['admin', 'technician']);
+        $stored = [];
+        foreach (db()->query('SELECT name, signature_data FROM technician_signatures')->fetchAll() as $row) $stored[$row['name']] = $row['signature_data'];
+        $list = [];
+        foreach (TECHNICIAN_NAMES as $name) $list[] = ['name' => $name, 'signature' => $stored[$name] ?? null];
+        json_response(['technicians' => $list]);
+    }
+
+    if ($action === 'technician-signature-save' && $method === 'POST') {
+        require_role(['admin']);
+        $name = clean_text($data['name'] ?? '', 140);
+        if (!in_array($name, TECHNICIAN_NAMES, true)) json_response(['error' => 'Selecciona un técnico de la lista.'], 422);
+        $signature = (string) ($data['signature'] ?? '');
+        if ($signature === '') {
+            db()->prepare('DELETE FROM technician_signatures WHERE name=?')->execute([$name]);
+            json_response(['ok' => true, 'message' => 'Firma de ' . $name . ' eliminada.']);
+        }
+        if (strlen($signature) > 800000 || preg_match('/^data:image\/png;base64,[A-Za-z0-9+\/=]+$/D', $signature) !== 1 || base64_decode(substr($signature, 22), true) === false) {
+            json_response(['error' => 'La firma no es válida. Dibújala de nuevo.'], 422);
+        }
+        db()->prepare('INSERT INTO technician_signatures (name, signature_data, updated_by) VALUES (?,?,?) ON DUPLICATE KEY UPDATE signature_data=VALUES(signature_data), updated_by=VALUES(updated_by)')->execute([$name, $signature, (int) $user['id']]);
+        json_response(['ok' => true, 'message' => 'Firma de ' . $name . ' guardada.']);
+    }
+
     if ($action === 'document-save' && $method === 'POST') {
         require_role(['admin', 'technician']);
         $assetId = (int) ($data['assetId'] ?? 0);
@@ -1649,7 +1455,7 @@ try {
         // En F-SIS-01 la persona atendida proviene del nombre asignado en ACTIVOS,
         // aunque no exista una cuenta en users. user_id se conserva como propietario
         // interno/auditoría; el nombre real queda en signed_name.
-        if ($formType === 'service_order' && $userId <= 0) {
+        if ($formType !== '' && $userId <= 0) {
             if ($maintenanceId > 0) {
                 $maintenanceOwner = db()->prepare('SELECT user_id FROM maintenance WHERE id=? LIMIT 1');
                 $maintenanceOwner->execute([$maintenanceId]);
@@ -1663,6 +1469,11 @@ try {
         $signature = (string) ($data['signature'] ?? '');
         $performedByName = clean_text($data['performedByName'] ?? '', 140);
         $performedBySignature = (string) ($data['performedBySignature'] ?? '');
+        if ($performedBySignature === '' && in_array($performedByName, TECHNICIAN_NAMES, true)) {
+            $storedSignature = db()->prepare('SELECT signature_data FROM technician_signatures WHERE name=? LIMIT 1');
+            $storedSignature->execute([$performedByName]);
+            $performedBySignature = (string) ($storedSignature->fetchColumn() ?: '');
+        }
         $fields = is_array($data['fields'] ?? null) ? $data['fields'] : [];
         $isSignature = static fn (string $value): bool => strlen($value) <= 800000 && preg_match('/^data:image\/png;base64,[A-Za-z0-9+\/=]+$/D', $value) === 1 && base64_decode(substr($value, 22), true) !== false;
         if (!$assetId || !$userId || !$formType || $signedName === '' || $performedByName === '' || !$isSignature($signature) || !$isSignature($performedBySignature)) {
@@ -1676,7 +1487,7 @@ try {
         $assetCheck = db()->prepare('SELECT id FROM assets WHERE id=? AND type="computer" AND status<>"retired" LIMIT 1');
         $assetCheck->execute([$assetId]);
         if (!$personCheck->fetchColumn() || !$assetCheck->fetchColumn()) {
-            json_response(['error' => 'Selecciona una persona y un equipo vigentes del inventario de Activos.'], 422);
+            json_response(['error' => 'Selecciona un equipo vigente del inventario de Activos.'], 422);
         }
         if ($maintenanceId) {
             $maintenanceCheck = db()->prepare('SELECT asset_id, user_id, status FROM maintenance WHERE id=?');
@@ -1699,7 +1510,7 @@ try {
         }
         $allowedFields = $formType === 'service_order'
             ? ['date', 'department', 'equipmentDetails', 'cleaningExterior', 'cleaningInterior', 'systemCleanup', 'virusReview', 'computerPassword', 'satisfaction', 'comments']
-            : ['date', 'failure', 'diagnosis', 'activities', 'closingDate', 'satisfaction', 'responseTime', 'solution', 'comments'];
+            : ['date', 'department', 'equipmentDetails', 'failure', 'diagnosis', 'activities', 'closingDate', 'satisfaction', 'responseTime', 'solution', 'comments'];
         $fieldLimits = ['date' => 10, 'department' => 140, 'equipmentDetails' => 1200, 'cleaningExterior' => 20, 'cleaningInterior' => 20, 'systemCleanup' => 20, 'virusReview' => 20, 'computerPassword' => 120, 'satisfaction' => 2, 'comments' => 2000, 'failure' => 2000, 'diagnosis' => 2000, 'activities' => 3000, 'closingDate' => 10, 'responseTime' => 140, 'solution' => 2000];
         $formFields = [];
         foreach ($allowedFields as $field) {
@@ -1760,6 +1571,8 @@ try {
             $historyDetails = implode("\n", [
                 'Solicitud de Mantenimiento Correctivo F-SIS-02',
                 'Fecha de solicitud: ' . $formFields['date'],
+                'Departamento: ' . ($formFields['department'] ?: 'No especificado'),
+                'Equipo: ' . ($formFields['equipmentDetails'] ?: 'No especificado'),
                 'Falla: ' . $formFields['failure'],
                 'Diagnóstico: ' . $formFields['diagnosis'],
                 'Actividades realizadas: ' . ($formFields['activities'] ?: 'No especificadas'),
@@ -1781,7 +1594,6 @@ try {
             if ($maintenanceId) {
                 $completeMaintenance = db()->prepare('UPDATE maintenance SET status="completed", completed_at=NOW(), signature_data=?, signed_name=?, signed_ip=? WHERE id=? AND status IN ("pending", "confirmed", "reschedule_requested")');
                 $completeMaintenance->execute([$signature, $signedName, $_SERVER['REMOTE_ADDR'] ?? null, $maintenanceId]);
-                append_linked_maintenance_event($maintenanceId, 'maintenance_completed', 'Mantenimiento completado mediante Orden de Servicio F-SIS-01.', (int) $user['id']);
                 if (!$completeMaintenance->rowCount()) {
                     throw new RuntimeException('El mantenimiento ya no está disponible para cerrar.');
                 }
@@ -1929,53 +1741,4 @@ function dashboard_charts(?int $userId = null): array
         'maintenanceStatus' => ['labels' => array_column($maintenanceStatusRows, 'label'), 'values' => array_map('intval', array_column($maintenanceStatusRows, 'value'))],
         'maintenanceMonthly' => ['labels' => $months, 'values' => $monthValues],
     ];
-}
-
-function send_maintenance_email(int $userId, int $assetId, string $scheduledAt, string $token): array
-{
-    global $config;
-    $statement = db()->prepare('SELECT u.name, u.email, a.asset_tag, a.brand, a.model FROM users u JOIN assets a ON a.id=? WHERE u.id=?');
-    $statement->execute([$assetId, $userId]);
-    $details = $statement->fetch();
-    if (!$details || !$config['smtp']['host'] || !$config['smtp']['from_email']) {
-        return ['sent' => false, 'message' => 'Mantenimiento agendado. Falta configurar SMTP; el correo no se envió.'];
-    }
-    $autoload = __DIR__ . '/../vendor/autoload.php';
-    if (!is_file($autoload)) {
-        return ['sent' => false, 'message' => 'Mantenimiento agendado. Instala las dependencias de Composer para habilitar el correo.'];
-    }
-    require_once $autoload;
-    $mailerClass = 'PHPMailer\\PHPMailer\\PHPMailer';
-    if (!class_exists($mailerClass)) {
-        return ['sent' => false, 'message' => 'Mantenimiento agendado. PHPMailer no está instalado; ejecuta composer install para habilitar el correo.'];
-    }
-    try {
-        $mail = new $mailerClass(true);
-        $mail->isSMTP();
-        $mail->Host = $config['smtp']['host'];
-        $mail->Port = $config['smtp']['port'];
-        $mail->SMTPAuth = $config['smtp']['username'] !== '';
-        $mail->Username = $config['smtp']['username'];
-        $mail->Password = $config['smtp']['password'];
-        if ($config['smtp']['encryption'] === 'tls') {
-            $mail->SMTPSecure = constant($mailerClass . '::ENCRYPTION_STARTTLS');
-        } elseif ($config['smtp']['encryption'] === 'ssl') {
-            $mail->SMTPSecure = constant($mailerClass . '::ENCRYPTION_SMTPS');
-        }
-        $mail->CharSet = 'UTF-8';
-        $mail->setFrom($config['smtp']['from_email'], $config['smtp']['from_name']);
-        $mail->addAddress($details['email'], $details['name']);
-        $mail->isHTML(true);
-        $mail->Subject = 'Agenda tu mantenimiento preventivo';
-        $inviteUrl = $config['app_url'] . '/respond.php?token=' . rawurlencode($token);
-        $date = date('d/m/Y H:i', strtotime($scheduledAt));
-        $mail->Body = '<p>Hola ' . htmlspecialchars($details['name'], ENT_QUOTES, 'UTF-8') . ',</p><p>Se programó el mantenimiento de <strong>' . htmlspecialchars($details['asset_tag'] . ' · ' . $details['brand'] . ' ' . $details['model'], ENT_QUOTES, 'UTF-8') . '</strong> para el ' . $date . '.</p><p><a href="' . htmlspecialchars($inviteUrl, ENT_QUOTES, 'UTF-8') . '">Confirmar o proponer otro horario</a></p>';
-        $mail->AltBody = "Se programó tu mantenimiento para el {$date}. Confirma o propone otro horario: {$inviteUrl}";
-        $mail->send();
-        db()->prepare('UPDATE maintenance SET invitation_sent_at=NOW() WHERE invite_token_hash=?')->execute([hash('sha256', $token)]);
-        return ['sent' => true, 'message' => 'Invitación enviada por correo.'];
-    } catch (Throwable $error) {
-        error_log('[Rame mail] ' . $error->getMessage());
-        return ['sent' => false, 'message' => 'Mantenimiento agendado, pero SMTP no pudo enviar el correo. Revisa la configuración.'];
-    }
 }

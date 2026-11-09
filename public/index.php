@@ -10,7 +10,7 @@ require __DIR__ . '/../app/bootstrap.php';
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#173b6c">
     <title>Rame | Operación TI</title>
-<link rel="stylesheet" href="assets/app.css?v=assets-responsibility-3">
+<link rel="stylesheet" href="assets/app.css?v=<?= filemtime(__DIR__ . '/assets/app.css') ?>">
 </head>
 <body>
     <main id="app" class="app-shell" aria-live="polite">
@@ -18,6 +18,6 @@ require __DIR__ . '/../app/bootstrap.php';
     </main>
     <div id="toast-region" class="toast-region" aria-live="polite"></div>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
-<script src="assets/app.js?v=rame-department-planning-20261104-7" defer></script>
+<script src="assets/app.js?v=<?= filemtime(__DIR__ . '/assets/app.js') ?>" defer></script>
 </body>
 </html>

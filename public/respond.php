@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 require __DIR__ . '/../app/bootstrap.php';
-$token = preg_replace('/[^a-f0-9]/', '', (string) ($_GET['token'] ?? ''));
+$token = preg_replace('/[^a-f0-9]/', '', strtolower((string) ($_GET['token'] ?? '')));
 ?>
 <!doctype html>
 <html lang="es">
@@ -11,13 +11,13 @@ $token = preg_replace('/[^a-f0-9]/', '', (string) ($_GET['token'] ?? ''));
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#173b6c">
     <title>Mantenimiento | Rame TI</title>
-    <link rel="stylesheet" href="assets/app.css?v=blue-brand-2">
+    <link rel="stylesheet" href="assets/app.css?v=maintenance-invitation-1">
 </head>
 <body class="invite-page">
     <main id="invite-app" class="invite-shell" data-token="<?= htmlspecialchars($token, ENT_QUOTES, 'UTF-8') ?>">
         <div class="loading-screen"><span class="loader"></span><span>Cargando invitación</span></div>
     </main>
     <div id="toast-region" class="toast-region" aria-live="polite"></div>
-    <script src="assets/respond.js?v=blue-brand-2" defer></script>
+    <script src="assets/respond.js?v=maintenance-invitation-1" defer></script>
 </body>
 </html>

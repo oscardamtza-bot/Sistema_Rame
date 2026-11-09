@@ -8,6 +8,8 @@ const routeLabels = {
     documents: ['Resguardo', 'Documentos'],
 };
 let csrfToken = '';
+const TECHNICIAN_NAMES = ['DULCE MARIA MUÑIZ LOPEZ', 'OSCAR DANIEL MARTINEZ AGUIRRE', 'CESAR ELIUD BERNAL RIVERA'];
+let technicianSignatures = {};
 let sessionUser = null;
 let currentRoute = 'dashboard';
 let peopleCache = [];
@@ -21,9 +23,9 @@ let assetPageSize = 0;
 let maintenanceCalendarDate = new Date();
 let maintenanceCalendarView = 'month';
 let maintenanceCache = [];
-let maintenanceDepartmentPlanCache = null;
 
 const escapeHtml = (value = '') => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+const ASSET_DEPARTMENTS = ['ADMINISTRACION Y CONTABILIDAD', 'DIRECCION GENERAL', 'ESTRATEGIA LOGISTICA', 'EXTERNO', 'FINANZAS', 'INTELIGENCIA COMERCIAL', 'MANTENIMIENTO', 'RECURSOS HUMANOS', 'RENDIMIENTOS', 'SEGURIDAD PATRIMONIAL'];
 const formatPersonName = value => String(value || '').toLocaleLowerCase('es-MX').replace(/(^|[\s'-])([a-záéíóúüñ])/g, (_, separator, initial) => separator + initial.toLocaleUpperCase('es-MX'));
 const dateTime = value => value ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(String(value).replace(' ', 'T'))) : 'Sin fecha';
 const statusText = status => ({ assigned: 'Activo', available: 'Disponible', maintenance: 'En mantenimiento', retired: 'Dado de baja', active: 'Activa', expiring: 'Por vencer', expired: 'Vencida', inactive: 'Inactiva', pending: 'Por confirmar', confirmed: 'Confirmada', reschedule_requested: 'Cambio solicitado', completed: 'Completado', cancelled: 'Cancelado' })[status] || status;
@@ -146,9 +148,8 @@ function pageAction(route) {
     if (route === 'assets' && ['admin', 'technician'].includes(sessionUser.role)) {
         return '<button class="primary-button" id="page-action"><span class="button-icon">+</span>Nuevo PC o laptop</button>';
     }
-    if (['assets', 'maintenance'].includes(route) && ['admin', 'technician'].includes(sessionUser.role)) {
-        const labels = { assets: 'Nuevo activo', maintenance: 'Agendar servicio' };
-        return `<button class="primary-button" id="page-action"><span class="button-icon">+</span>${labels[route]}</button>`;
+    if (route === 'assets' && ['admin', 'technician'].includes(sessionUser.role)) {
+        return '<button class="primary-button" id="page-action"><span class="button-icon">+</span>Nuevo activo</button>';
     }
     if (route === 'users' && sessionUser.role === 'admin') return '<button class="primary-button" id="page-action"><span class="button-icon">+</span>Agregar usuario</button>';
     return '';
@@ -190,7 +191,7 @@ function updateDashboardSummary(target, counts) {
     kpis[2]?.remove();
     target.querySelector('.kpi-grid')?.classList.add('kpi-grid-compact');
     const updateKpi = (labelMatch, label, value, glyph, note) => {
-        const card = [...target.querySelectorAll('.kpi')].find(item => item.querySelector('.kpi-top > span:first-child')?.textContent === labelMatch);
+        const card = [...target.querySelectorAll('.kpi')].find(item => item.textContent.includes(labelMatch));
         if (!card) return;
         card.querySelector('.kpi-top > span:first-child').textContent = label;
         card.querySelector('.kpi-glyph').textContent = glyph;
@@ -198,7 +199,12 @@ function updateDashboardSummary(target, counts) {
         card.querySelector('.kpi-note').textContent = note;
     };
     updateKpi('Activos en operación', 'Activos en operación', counts.assets, '▣', 'PC y laptops');
-    updateKpi('Licencias vigentes', 'Mantenimientos en curso', counts.maintenance, '◷', 'Pendientes y confirmados');
+    if (counts.month_planned !== undefined) {
+        const monthName = new Intl.DateTimeFormat('es-MX', { month: 'long' }).format(new Date());
+        updateKpi('Licencias vigentes', 'Mantenimientos en curso', counts.month_pending, '◷', `${counts.month_done} realizados de ${counts.month_planned} programados en ${monthName}`);
+    } else {
+        updateKpi('Licencias vigentes', 'Mantenimientos en curso', counts.maintenance, '◷', 'Pendientes y confirmados');
+    }
     const assetAction = target.querySelector('[data-create="assets"]');
     if (assetAction) {
         assetAction.querySelector('strong').textContent = 'Registrar PC o laptop';
@@ -447,82 +453,130 @@ async function licensesView() {
 
 async function usersView() {
     const { users } = await api('users');
-    return `<section class="section-panel"><div class="toolbar"><span class="mono">${users.length} cuentas</span><span class="toolbar-spacer"></span><span class="field-help">Las contraseñas se almacenan con hash seguro y no se pueden consultar.</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Nombre</th><th>Correo</th><th>Área</th><th>Permiso</th><th>Alta</th></tr></thead><tbody>${users.map(item => `<tr><td><span class="table-primary">${escapeHtml(item.name)}</span></td><td>${escapeHtml(item.email)}</td><td>${escapeHtml(item.department || '—')}</td><td><span class="status-pill ${item.role === 'admin' ? 'status-confirmed' : ''}">${item.role === 'admin' ? 'Administrador' : item.role === 'technician' ? 'Técnico' : 'Usuario'}</span></td><td>${fmtDate(item.created_at)}</td></tr>`).join('')}</tbody></table>${users.length ? '' : emptyState('Sin cuentas adicionales', 'Agrega usuarios para asignarles equipos y documentos.')}</div></section>`;
+    const roleLabel = role => role === 'admin' ? 'Administrador' : role === 'technician' ? 'Técnico' : 'Usuario';
+    const initials = name => String(name || '?').trim().split(/\s+/).slice(0, 2).map(part => part[0]).join('').toUpperCase();
+    const countRole = role => users.filter(item => item.role === role).length;
+    const summary = [['Cuentas', users.length], ['Administradores', countRole('admin')], ['Técnicos', countRole('technician')], ['Usuarios', countRole('user')]]
+        .map(([label, value]) => `<div class="user-summary-item"><strong>${value}</strong><span>${label}</span></div>`).join('');
+    const cards = users.map(item => `<article class="user-card" data-user-search="${escapeHtml(`${item.name} ${item.email} ${item.department || ''}`.toLowerCase())}"><div class="user-card-avatar">${escapeHtml(initials(item.name))}</div><div class="user-card-main"><strong>${escapeHtml(formatPersonName(item.name))}</strong><a href="mailto:${escapeHtml(item.email)}">${escapeHtml(item.email)}</a><div class="user-card-meta"><span>${escapeHtml(item.department ? formatPersonName(item.department) : 'Sin área')}</span><span>Alta ${fmtDate(item.created_at)}</span></div></div><span class="status-pill ${item.role === 'admin' ? 'status-confirmed' : ''}">${roleLabel(item.role)}</span></article>`).join('');
+    return `<section class="section-panel"><div class="user-summary">${summary}</div><div class="toolbar"><input class="search-input" id="user-search" type="search" placeholder="Buscar por nombre, correo o área" oninput="document.querySelectorAll('.user-card').forEach(card => card.hidden = !card.dataset.userSearch.includes(this.value.trim().toLowerCase()))"><span class="toolbar-spacer"></span><span class="field-help">Las contraseñas se almacenan con hash seguro y no se pueden consultar.</span></div><div class="user-grid">${cards}</div>${users.length ? '' : emptyState('Sin cuentas adicionales', 'Agrega usuarios para asignarles equipos y documentos.')}</section>`;
 }
 
 async function maintenanceViewLegacy() { return maintenanceView(); }
 
 async function maintenanceView() {
     const year = maintenanceCalendarDate.getFullYear();
-    const [{ maintenances, annualProgress }, departmentPlan] = await Promise.all([
+    const [{ maintenances, annualProgress }, program] = await Promise.all([
         api('maintenances', { query: { year } }),
-        ['admin', 'technician'].includes(sessionUser.role) ? api('maintenance-department-plan', { query: { year } }) : Promise.resolve(null),
+        ['admin', 'technician'].includes(sessionUser.role) ? api('maintenance-program', { query: { year } }) : Promise.resolve(null),
     ]);
-    maintenanceDepartmentPlanCache = departmentPlan;
     maintenanceCache = maintenances;
-    const now = new Date();
-    const overdue = item => ['pending', 'confirmed', 'reschedule_requested'].includes(item.status) && new Date(String(item.calendar_at || item.scheduled_at).replace(' ', 'T')) < now;
-    const card = (label, value, note, tone) => `<article class="maintenance-kpi maintenance-kpi-${tone}"><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`;
-    const currentYearItems = maintenances.filter(item => String(item.calendar_at || item.scheduled_at).slice(0, 4) === String(year));
-    const completed = currentYearItems.filter(item => item.status === 'completed').length;
-    const pending = currentYearItems.filter(item => ['pending', 'reschedule_requested'].includes(item.status)).length;
-    const confirmed = currentYearItems.filter(item => item.status === 'confirmed').length;
-    const delayed = currentYearItems.filter(overdue).length;
-    const progressCards = (annualProgress || []).map(item => {
+    const progressRows = (annualProgress || []).map(item => {
         const count = Math.min(2, Number(item.completed_count) || 0);
-        return `<article class="maintenance-progress-card ${count === 2 ? 'complete' : ''}"><div><strong>${escapeHtml(item.asset_tag)}</strong><span>${escapeHtml(`${item.brand || ''} ${item.model || ''}`.trim())}</span></div><b>${count}/2</b><div class="maintenance-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="2" aria-valuenow="${count}" aria-label="${escapeHtml(item.asset_tag)}: ${count} de 2 mantenimientos completados"><span style="width:${count * 50}%"></span></div><small>${count === 2 ? 'Meta anual cumplida' : `Faltan ${2 - count} por completar`}</small></article>`;
+        const dates = (item.forms || []).map(form => String(form.done_at).slice(0, 10));
+        const slot = index => {
+            const form = (item.forms || [])[index];
+            if (!form) return '<td class="annual-slot muted">—</td>';
+            return `<td class="annual-slot"><div class="annual-chip"><span class="annual-date">${escapeHtml(String(form.done_at).slice(0, 10))}</span><button class="annual-btn" type="button" data-annual-preview="${form.id}">Ver</button><button class="annual-btn primary" type="button" data-annual-print="${form.id}">Imprimir</button></div></td>`;
+        };
+        const search = `${item.asset_tag} ${item.brand || ''} ${item.model || ''}`.toLocaleLowerCase('es-MX');
+        return `<tr class="annual-row" data-dates="${dates.join(',')}" data-search="${escapeHtml(search)}"><td><strong class="annual-tag">${escapeHtml(item.asset_tag)}</strong></td><td class="annual-model">${escapeHtml(`${item.brand || ''} ${item.model || ''}`.trim())}</td><td class="annual-prog"><span class="annual-badge ${count === 2 ? 'complete' : 'partial'}">${count}/2</span></td>${slot(0)}${slot(1)}</tr>`;
     }).join('');
-    return `<section class="maintenance-overview">${card('Servicios del año', currentYearItems.length, String(year), 'neutral')}${card('Por confirmar', pending, 'Requieren seguimiento', 'warning')}${card('Confirmados', confirmed, 'Horario reservado', 'info')}${card('Vencidos', delayed, 'Pasó su horario', 'danger')}${card('Completados', completed, 'Cierres F-SIS-01', 'success')}</section>
-    ${departmentPlan ? maintenanceDepartmentPlanningMarkup(departmentPlan) : ''}
-    <section class="section-panel maintenance-progress-panel"><div class="maintenance-section-heading"><div><h2>Avance anual por equipo</h2><p>Solo cuentan los servicios completados durante ${year}.</p></div><strong>${annualProgress?.length || 0} equipos</strong></div><div class="maintenance-progress-grid">${progressCards || emptyState('Sin equipos activos', 'Agrega equipos en Activos para ver su avance anual.')}</div></section>
-    <section class="section-panel maintenance-calendar-panel"><div class="maintenance-calendar-toolbar"><div class="maintenance-calendar-nav"><button type="button" class="small-button" id="maintenance-calendar-prev" aria-label="Periodo anterior">‹</button><button type="button" class="small-button" id="maintenance-calendar-today">Hoy</button><button type="button" class="small-button" id="maintenance-calendar-next" aria-label="Periodo siguiente">›</button><h2 id="maintenance-calendar-label"></h2></div><div class="maintenance-calendar-views"><button type="button" data-calendar-view="month" class="${maintenanceCalendarView === 'month' ? 'active' : ''}">Mes</button><button type="button" data-calendar-view="week" class="${maintenanceCalendarView === 'week' ? 'active' : ''}">Semana</button><button type="button" data-calendar-view="day" class="${maintenanceCalendarView === 'day' ? 'active' : ''}">Día</button></div></div><div class="maintenance-calendar-filters"><input class="search-input" id="maintenance-search" type="search" placeholder="Buscar persona, inventario, marca o modelo"><select class="filter-select" id="maintenance-status-filter"><option value="">Todos los estados</option><option value="pending">Por confirmar</option><option value="confirmed">Confirmados</option><option value="reschedule_requested">Cambio solicitado</option><option value="completed">Completados</option><option value="cancelled">Cancelados</option></select><span class="field-help">Atención: 8:30 a. m. a 5:00 p. m. · intervalos de 30 minutos</span></div><div id="maintenance-calendar">${maintenanceCalendarMarkup(maintenances)}</div></section>`;
+    const progressTable = progressRows
+        ? `<div class="annual-filters"><input class="search-input" id="annual-search" type="search" placeholder="Buscar inventario o equipo"><label>Desde <input type="date" id="annual-from"></label><label>Hasta <input type="date" id="annual-to"></label><button class="small-button" type="button" id="annual-clear">Limpiar</button><span class="field-help" id="annual-count"></span></div><div class="table-wrap annual-wrap"><table class="annual-table"><thead><tr><th>Inventario</th><th>Equipo</th><th>Avance</th><th>Mantenimiento 1</th><th>Mantenimiento 2</th></tr></thead><tbody>${progressRows}</tbody></table></div>`
+        : emptyState('Sin formatos guardados', `Aún no hay formatos F-SIS-01 firmados en ${year}.`);
+    return `
+    ${program ? maintenanceProgramMarkup(program) : ''}
+    <section class="section-panel maintenance-progress-panel"><div class="maintenance-section-heading"><div><h2>Avance anual por equipo</h2><p>Equipos con formato F-SIS-01 firmado durante ${year}. Cada equipo requiere 2 mantenimientos al año.</p></div><strong>${annualProgress?.length || 0} equipos</strong></div>${progressTable}</section>
+    `;
 }
 
 const maintenanceMonthNames = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
-function maintenanceDepartmentPlanningMarkup(data) {
-    const plannedAssets = data.plans.reduce((sum, plan) => sum + Number(plan.current_assets || 0), 0);
-    const completedAssets = data.plans.reduce((sum, plan) => sum + Number(plan.completed_assets || 0), 0);
-    const months = data.months.map(entry => {
-        const plans = entry.departments || [];
-        const teamCount = plans.reduce((sum, plan) => sum + Number(plan.current_assets || 0), 0);
-        const rows = plans.map(plan => {
-            const progress = Number(plan.progress || 0);
-            const state = plan.request_status === 'confirmed' ? (Number(plan.pending_assets) ? 'Horario confirmado' : 'Mantenimiento completado') : plan.request_status === 'email_sent' ? 'Horario pendiente de confirmación' : plan.request_status === 'notification_pending' ? 'Notificación pendiente' : plan.request_status === 'cancelled' ? 'Solicitud cancelada' : plan.request_status === 'expired' ? 'Solicitud vencida' : 'Pendiente de programación';
-            return `<article class="department-plan-row"><div class="department-plan-title"><strong>${escapeHtml(plan.department)}</strong><span>${Number(plan.current_assets)} equipos · ${Number(plan.completed_assets)} completados · ${Number(plan.pending_assets)} pendientes</span><small>${state}${plan.scheduled_start ? ` · ${escapeHtml(dateTime(plan.scheduled_start))}` : ''}</small></div><div class="maintenance-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}" aria-label="${escapeHtml(plan.department)} ${progress}%"><span style="width:${progress}%"></span></div><div class="department-plan-actions"><button class="small-button" type="button" data-department-equipment="${plan.id}">Equipos</button>${sessionUser.role === 'admin' ? `<button class="small-button primary-mini" type="button" data-department-notify="${plan.id}">${['email_sent','expired'].includes(plan.request_status) ? 'Revisar / reenviar' : plan.request_status === 'confirmed' ? 'Ver solicitud' : 'Revisar y notificar'}</button>` : ''}</div></article>`;
+function maintenanceProgramMarkup(program) {
+    const monthLetters = ['E', 'F', 'M', 'A', 'M', 'J', 'J', 'A', 'S', 'O', 'N', 'D'];
+    const departments = [...new Set(program.items.map(item => item.department).filter(Boolean))].sort();
+    const percent = program.planned ? Math.round((program.realized / program.planned) * 100) : 0;
+    const rows = program.items.map(item => {
+        const search = `${item.tag} ${item.model} ${item.serial} ${item.department}`.toLocaleLowerCase('es-MX');
+        const cells = kind => monthLetters.map((_, index) => {
+            const month = index + 1;
+            if (kind === 'P') return `<td class="program-cell">${item.months.includes(month) ? 'X' : ''}</td>`;
+            const done = item.done.includes(month);
+            return `<td class="program-cell ${done ? 'program-done' : ''}">${done ? '✓' : ''}</td>`;
         }).join('');
-        return `<section class="department-month-card"><header><div><h3>${maintenanceMonthNames[entry.month - 1]}</h3><span>${teamCount} equipos · ${plans.length} departamentos</span></div>${sessionUser.role === 'admin' ? `<button class="small-button" type="button" data-department-edit-month="${entry.month}">Editar</button>` : ''}</header><div class="department-month-rows">${rows || '<div class="department-month-empty">Sin departamentos programados. Selecciona “Editar” para preparar la distribución.</div>'}</div></section>`;
+        const head = `<td rowspan="2">${item.seq || ''}</td><td rowspan="2">${escapeHtml(item.model)}</td><td rowspan="2">${escapeHtml(item.serial)}</td><td rowspan="2"><strong>${escapeHtml(item.tag)}</strong></td><td rowspan="2">${escapeHtml(item.department)}</td><td rowspan="2">${escapeHtml(item.monitor || '')}</td>`;
+        return `<tbody class="program-item" data-department="${escapeHtml(item.department)}" data-search="${escapeHtml(search)}"><tr>${head}<td class="program-kind">P</td>${cells('P')}</tr><tr><td class="program-kind">R</td>${cells('R')}</tr></tbody>`;
     }).join('');
-    const unclassified = data.unclassifiedAssets || [];
-    return `<section class="section-panel department-planning-panel"><div class="maintenance-section-heading"><div><h2>Programa anual por departamento</h2><p>Equipos y departamentos se leen de Activos. La distribución de ${data.year} es editable.</p></div><label class="department-year-picker">Año<select id="department-plan-year">${data.years.map(value => `<option value="${value}" ${Number(value) === Number(data.year) ? 'selected' : ''}>${value}</option>`).join('')}</select></label></div><div class="department-plan-summary"><strong>${data.departments.filter(dept => dept.eligible && !dept.unclassified).length} departamentos disponibles</strong><span>${plannedAssets} equipos planificados · ${completedAssets} completados</span><span>Gmail ${data.emailReady ? 'configurado' : 'pendiente de configuración'}</span></div><details class="department-directory"><summary>Consultar equipos por departamento (${data.departments.filter(dept => !dept.unclassified).length})</summary><div class="department-directory-grid">${data.departments.filter(dept => !dept.unclassified).map(dept => `<details class="department-directory-item"><summary>${escapeHtml(dept.name || 'Sin departamento')} · ${Number(dept.totalAssets)} equipos (${Number(dept.activeAssets)} activos)</summary><div class="table-wrap"><table class="data-table"><thead><tr><th>Inventario</th><th>Equipo</th><th>Responsable / persona(s) asignada(s)</th><th>Estado</th></tr></thead><tbody>${dept.assets.map(asset => `<tr><td>${escapeHtml(asset.asset_tag)}</td><td>${escapeHtml(`${asset.brand || ''} ${asset.model || ''}`.trim())}</td><td>${escapeHtml((asset.assigned_people || []).join(', ') || 'Sin persona asignada')}</td><td>${escapeHtml(statusText(asset.status))}</td></tr>`).join('') || '<tr><td colspan="4">Sin equipos vigentes.</td></tr>'}</tbody></table></div></details>`).join('')}</div></details><div class="department-month-grid">${months}</div><details class="department-unclassified"><summary>Pendientes de clasificación (${unclassified.length})</summary><div class="table-wrap"><table class="data-table"><thead><tr><th>Inventario</th><th>Equipo</th><th>Departamento en Activos</th><th>Estado</th></tr></thead><tbody>${unclassified.map(asset => `<tr><td>${escapeHtml(asset.asset_tag)}</td><td>${escapeHtml(`${asset.brand || ''} ${asset.model || ''}`.trim())}</td><td>${escapeHtml(asset.department || 'Sin departamento')}</td><td>${escapeHtml(statusText(asset.status))}</td></tr>`).join('') || '<tr><td colspan="4">No hay equipos sin clasificación.</td></tr>'}</tbody></table></div><p>Estos equipos requieren clasificación en Activos y no se asignan automáticamente.</p></details><details class="department-plan-history"><summary>Historial de cambios (${data.history.length})</summary><div class="table-wrap"><table class="data-table"><thead><tr><th>Fecha</th><th>Mes</th><th>Departamento</th><th>Acción</th><th>Destinatario</th></tr></thead><tbody>${data.history.map(row => `<tr><td>${escapeHtml(dateTime(row.changed_at))}</td><td>${maintenanceMonthNames[Number(row.plan_month)-1]}</td><td>${escapeHtml(row.department)}</td><td>${row.action === 'added' ? 'Agregado' : row.action === 'removed' ? 'Retirado' : 'Destinatario actualizado'}</td><td>${escapeHtml(row.recipient_email || '—')}</td></tr>`).join('') || '<tr><td colspan="5">Aún no hay cambios.</td></tr>'}</tbody></table></div></details></section>`;
+    const yearNow = new Date().getFullYear();
+    const yearPicker = `<label class="department-year-picker">Año<select id="department-plan-year">${Array.from({ length: Math.max(yearNow, Number(program.year)) - 2026 + 3 }, (_, index) => 2026 + index).map(value => `<option value="${value}" ${value === Number(program.year) ? 'selected' : ''}>${value}</option>`).join('')}</select></label>`;
+    const upload = sessionUser.role === 'admin' ? `<form id="program-import-form" class="program-import"><input type="file" name="program" accept=".xlsx" required><button class="primary-button" type="submit">Subir Excel</button></form><button class="secondary-button" type="button" id="program-generate">Generar programa ${program.year}</button>` : '';
+    const exportButton = program.items.length ? `<a class="secondary-button" id="program-export" href="api.php?action=maintenance-program-export&year=${program.year}">Descargar Excel</a>` : '';
+    const meta = program.meta || {};
+    const editMeta = sessionUser.role === 'admin' ? `<button class="secondary-button" type="button" id="program-meta-edit">Editar encabezado</button>` : '';
+    const dsisHeader = `<table class="dsis-header"><tr><td rowspan="4" class="dsis-logo"><img src="assets/fsis01-logo-original.png" alt="Grupo Rame"></td><td rowspan="2" class="dsis-title">DOCUMENTOS</td><th>Codigo</th><th>Fecha de Emision</th></tr><tr><td><strong>D-SIS-01</strong></td><td><strong>${escapeHtml(meta.issue_date || '')}</strong></td></tr><tr><td rowspan="2" class="dsis-title dsis-subtitle">PROGRAMA DE MANTENIMIENTO DE HARDWARE Y SOFTWARE</td><th>Revision</th><th>Fecha de Revision</th></tr><tr><td><strong>${escapeHtml(meta.revision || '')}</strong></td><td><strong>${escapeHtml(meta.revision_date || '')}</strong></td></tr></table><div class="dsis-update"><span><b>Responsable de actualización:</b> ${escapeHtml(meta.updated_by_name || '—')}</span><span><b>Fecha de actualización:</b> ${escapeHtml(meta.updated_on || '—')}</span>${editMeta}</div>`;
+    const table = program.items.length
+        ? `<div class="program-progress"><div class="program-progress-text"><strong>${program.realized} de ${program.planned} mantenimientos realizados</strong><span>${percent}% · ${program.items.length} equipos</span></div><div class="program-progress-bar"><i style="width:${Math.min(100, Number(percent) || 0)}%"></i></div></div><div class="maintenance-calendar-filters"><input class="search-input" id="program-search" type="search" placeholder="Buscar inventario, modelo o serie"><select class="filter-select" id="program-department"><option value="">Todos los departamentos</option>${departments.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}</select></div>${dsisHeader}<div class="table-wrap"><table class="program-table"><thead><tr><th rowspan="2">N°</th><th rowspan="2">MODELO DEL EQUIPO</th><th rowspan="2">N° SERIE (ST)</th><th rowspan="2">N° DE IDENTIFICACIÓN</th><th rowspan="2">DEPARTAMENTO</th><th rowspan="2">MONITOR</th><th rowspan="2">PROG. REAL.</th><th colspan="12">MES</th></tr><tr>${monthLetters.map((letter, index) => `<th title="${maintenanceMonthNames[index]}">${letter}</th>`).join('')}</tr></thead>${rows}</table></div>`
+        : emptyState('Sin programa cargado', `Sube el Excel del programa ${program.year} para ver la tabla de equipos.`);
+    return `<section class="section-panel program-panel"><div class="maintenance-section-heading"><div><h2>Programa de mantenimiento ${program.year}</h2><p>Sube el Excel D-SIS-01. Cada mes programado (X) se marca como realizado (✓) al guardar el formato F-SIS-01 del equipo.</p></div></div><div class="program-tools">${yearPicker}${upload}${exportButton}</div>${table}</section>`;
 }
 
-function openDepartmentMonthEditor(month, data) {
-    const scheduled = new Set((data.months.find(item => Number(item.month) === Number(month))?.departments || []).map(plan => plan.department));
-    const options = data.departments.filter(dept => dept.eligible && !dept.unclassified).map(dept => `<label class="department-check"><input type="checkbox" name="department" value="${escapeHtml(dept.name)}" ${scheduled.has(dept.name) ? 'checked' : ''}><span><strong>${escapeHtml(dept.name)}</strong><small>${Number(dept.activeAssets)} equipos activos</small></span></label>`).join('');
-    showModal(`Planificación · ${maintenanceMonthNames[month - 1]} ${data.year}`, `<form id="department-month-form"><p>Selecciona departamentos registrados en Activos. Los equipos y personas asignadas se actualizan desde el inventario.</p><div class="department-check-list">${options || '<p>No hay departamentos con equipos vigentes.</p>'}</div><div id="modal-error" class="form-error" role="alert"></div><div class="form-actions"><button type="button" class="secondary-button" data-close>Cancelar</button><button type="submit" class="primary-button">Guardar planificación</button></div></form>`);
-    document.querySelector('#department-month-form')?.addEventListener('submit', async event => {
-        event.preventDefault(); const button = event.currentTarget.querySelector('[type="submit"]'); button.disabled = true;
-        try { await api('maintenance-department-plan-save', { method: 'POST', body: { year: Number(data.year), month: Number(month), departments: [...event.currentTarget.querySelectorAll('input[name="department"]:checked')].map(input => input.value) } }); closeModal(); toast('Planificación guardada con historial.'); await renderApp(); }
-        catch (error) { document.querySelector('#modal-error').textContent = error.message; button.disabled = false; }
-    });
-}
-
-async function openDepartmentDetails(planId, notify = false) {
-    try {
-        const preview = await api('maintenance-department-preview', { query: { id: planId } });
-        const plan = preview.plan; const monthName = maintenanceMonthNames[Number(plan.plan_month) - 1];
-        const equipment = preview.assets.map(asset => `<tr><td>${escapeHtml(asset.asset_tag)}</td><td>${escapeHtml(`${asset.brand || ''} ${asset.model || ''}`.trim())}</td><td>${escapeHtml((asset.assigned_people || []).join(', ') || 'Sin persona asignada')}</td></tr>`).join('');
-        if (!notify) { showModal(`${plan.department} · ${monthName} ${plan.plan_year}`, `<p>${preview.assets.length} equipos activos en Activos.</p><div class="table-wrap"><table class="data-table"><thead><tr><th>Inventario</th><th>Equipo</th><th>Persona(s) asignada(s)</th></tr></thead><tbody>${equipment}</tbody></table></div><div class="form-actions"><button class="secondary-button" type="button" data-close>Cerrar</button></div>`); return; }
-        const recipient = plan.request_email || plan.recipient_email || preview.emailSuggestions[0] || '';
-        const resend = ['email_sent', 'expired'].includes(plan.request_status);
-        showModal(`Revisar notificación · ${plan.department}`, `<p>Periodo: <strong>${monthName} ${plan.plan_year}</strong> · Equipos: <strong>${preview.assets.length}</strong></p><p>Verifica el destinatario y los equipos antes de enviar.</p><div class="field"><label for="department-recipient">Correo del responsable *</label><input id="department-recipient" type="email" maxlength="190" required value="${escapeHtml(recipient)}" placeholder="nombre@empresa.com"></div>${preview.emailSuggestions.length ? `<p class="field-help">Correos vinculados a cuentas de Activos: ${preview.emailSuggestions.map(escapeHtml).join(', ')}. Confirma que sea el contacto correcto.</p>` : '<p class="field-help">No hay correos relacionados en Activos. Ingresa el correo confirmado del responsable.</p>'}<details><summary>Revisar equipos incluidos</summary><div class="table-wrap"><table class="data-table"><thead><tr><th>Inventario</th><th>Equipo</th><th>Asignado a</th></tr></thead><tbody>${equipment}</tbody></table></div></details><div class="notice ${preview.emailReady ? '' : 'error'}"><span>!</span><div><strong>${preview.emailReady ? 'Gmail SMTP configurado' : 'Gmail no disponible'}</strong>${preview.emailReady ? 'Se informará si SMTP acepta el correo.' : 'Revisa configuración local y PHPMailer.'}</div></div><div id="modal-error" class="form-error" role="alert"></div><div class="form-actions"><button class="secondary-button" type="button" data-close>Cancelar</button><button class="primary-button" type="button" id="department-send" ${preview.emailReady ? '' : 'disabled'}>${resend ? 'Revocar enlace y reenviar' : 'Enviar correo revisado'}</button></div>`);
-        document.querySelector('#department-send')?.addEventListener('click', async event => {
-            const email = document.querySelector('#department-recipient').value.trim(); if (!email) { document.querySelector('#modal-error').textContent = 'Ingresa el correo confirmado del destinatario.'; return; }
-            const button = event.currentTarget; button.disabled = true;
-            try { const result = await api('maintenance-department-notify', { method: 'POST', body: { planId: Number(planId), recipientEmail: email, resend } }); closeModal(); toast(result.message, result.emailSent ? '' : 'error'); await renderApp(); }
-            catch (error) { document.querySelector('#modal-error').textContent = error.message; button.disabled = false; }
+function bindMaintenanceProgram() {
+    const filterAnnual = () => {
+        const text = (document.querySelector('#annual-search')?.value || '').toLocaleLowerCase('es-MX').trim();
+        const from = document.querySelector('#annual-from')?.value || '';
+        const to = document.querySelector('#annual-to')?.value || '';
+        let visible = 0;
+        document.querySelectorAll('.annual-row').forEach(row => {
+            const dates = row.dataset.dates ? row.dataset.dates.split(',') : [];
+            const inRange = (!from && !to) || dates.some(date => (!from || date >= from) && (!to || date <= to));
+            row.hidden = !(inRange && (!text || row.dataset.search.includes(text)));
+            if (!row.hidden) visible++;
         });
-    } catch (error) { toast(error.message, 'error'); }
+        const counter = document.querySelector('#annual-count'); if (counter) counter.textContent = `${visible} equipos`;
+    };
+    ['#annual-search', '#annual-from', '#annual-to'].forEach(selector => document.querySelector(selector)?.addEventListener('input', filterAnnual));
+    document.querySelector('#annual-clear')?.addEventListener('click', () => {
+        ['#annual-search', '#annual-from', '#annual-to'].forEach(selector => { const input = document.querySelector(selector); if (input) input.value = ''; });
+        filterAnnual();
+    });
+    filterAnnual();
+    const filter = () => {
+        const text = (document.querySelector('#program-search')?.value || '').toLocaleLowerCase('es-MX').trim();
+        const department = document.querySelector('#program-department')?.value || '';
+        document.querySelectorAll('.program-item').forEach(item => { item.hidden = Boolean((department && item.dataset.department !== department) || (text && !item.dataset.search.includes(text))); });
+    };
+    document.querySelector('#program-search')?.addEventListener('input', filter);
+    document.querySelector('#program-department')?.addEventListener('change', filter);
+    document.querySelector('#program-meta-edit')?.addEventListener('click', () => {
+        const year = maintenanceCalendarDate.getFullYear();
+        api('maintenance-program', { query: { year } }).then(({ meta = {} }) => {
+            const field = (name, label, value, help = '') => `<div class="field"><label for="meta-${name}">${label}</label><input id="meta-${name}" name="${name}" value="${escapeHtml(value || '')}" ${name === 'revision' ? 'required' : ''}>${help ? `<span class="field-help">${help}</span>` : ''}</div>`;
+            showModal(`Encabezado D-SIS-01 · ${year}`, `<form id="program-meta-form"><div class="form-grid">${field('revision', 'Revisión *', meta.revision)}${field('issue_date', 'Fecha de emisión', meta.issue_date, 'Ej. 25 de Abril del 2023')}${field('revision_date', 'Fecha de revisión', meta.revision_date, 'Ej. 13 de Febrero de 2027')}${field('updated_by_name', 'Responsable de actualización', meta.updated_by_name)}<div class="field"><label for="meta-updated_on">Fecha de actualización</label><input id="meta-updated_on" name="updated_on" type="date" value="${(String(meta.updated_on || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/) || []).slice(1).reverse().join('-')}"></div></div><div class="form-actions"><button class="secondary-button" type="button" data-close>Cancelar</button><button class="primary-button" type="submit">Guardar</button></div></form>`);
+            document.querySelector('#program-meta-form').addEventListener('submit', async event => {
+                event.preventDefault();
+                const body = Object.fromEntries(new FormData(event.currentTarget).entries()); body.year = year; body.updated_on = body.updated_on ? body.updated_on.split('-').reverse().join('/') : '';
+                try { const result = await api('maintenance-program-meta', { method: 'POST', body }); closeModal(); toast(result.message); await renderApp(); }
+                catch (error) { toast(error.message, 'error'); }
+            });
+        }).catch(error => toast(error.message, 'error'));
+    });    document.querySelector('#program-generate')?.addEventListener('click', async event => {
+        const year = maintenanceCalendarDate.getFullYear();
+        if (!confirm(`Se generará el programa ${year} con todos los equipos activos del inventario, agrupados por departamento y con 2 mantenimientos por equipo. Si ya existe un programa ${year}, se reemplazará. ¿Continuar?`)) return;
+        const button = event.currentTarget; button.disabled = true;
+        try { const result = await api('maintenance-program-generate', { method: 'POST', body: { year } }); toast(result.message); await renderApp(); }
+        catch (error) { toast(error.message, 'error'); button.disabled = false; }
+    });
+    document.querySelector('#program-import-form')?.addEventListener('submit', async event => {
+        event.preventDefault();
+        const form = event.currentTarget; const button = form.querySelector('[type="submit"]'); button.disabled = true;
+        const body = new FormData(form); body.append('year', String(maintenanceCalendarDate.getFullYear()));
+        try {
+            const response = await fetch(new URL('api.php?action=maintenance-program-import', window.location.href), { method: 'POST', headers: { 'X-CSRF-Token': csrfToken }, body, credentials: 'same-origin' });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(result.error || 'No fue posible importar el Excel.');
+            toast(result.message); await renderApp();
+        } catch (error) { toast(error.message, 'error'); button.disabled = false; }
+    });
 }
 
 function maintenanceDateKey(date) {
@@ -570,7 +624,7 @@ async function credentialsView() {
 async function documentsView() {
     const { documents } = await api('documents');
     const isStaff = ['admin', 'technician'].includes(sessionUser.role);
-    const createButtons = isStaff ? '<div class="document-list-actions"><button class="primary-button" id="create-service-order"><span class="button-icon">+</span>F-SIS-01 · Orden de Servicio</button><button class="secondary-button" id="create-corrective-request"><span class="button-icon">+</span>F-SIS-02 · Solicitud Correctiva</button></div>' : '';
+    const createButtons = isStaff ? '<div class="document-list-actions"><button class="primary-button" id="create-service-order"><span class="button-icon">+</span>F-SIS-01 · Orden de Servicio</button><button class="secondary-button" id="create-corrective-request"><span class="button-icon">+</span>F-SIS-02 · Solicitud Correctiva</button>' + (sessionUser.role === 'admin' ? '<button class="secondary-button" id="manage-tech-signatures">Firmas del personal TI</button>' : '') + '</div>' : '';
     return `<section class="section-panel"><div class="toolbar document-toolbar"><span class="mono">${documents.length} documentos</span><span class="toolbar-spacer"></span><span class="field-help">${isStaff ? 'Los formatos nuevos guardan las dos firmas, fecha e IP.' : 'Consulta tus formatos firmados y pendientes.'}</span>${createButtons}</div>${!isStaff ? '<div class="document-access-note">La creación de formatos está disponible para administración y técnicos.</div>' : ''}<div class="table-wrap"><table class="data-table"><thead><tr><th>Documento</th><th>Equipo</th><th>Responsable</th><th>Estado</th><th>Acciones</th></tr></thead><tbody>${documents.map(doc => { const signed = Boolean(doc.signed_at && (doc.form_type === 'responsibility' || doc.performed_by_signed_at)); return `<tr><td><span class="table-primary">${escapeHtml(doc.title)}</span><span class="table-secondary">${signed ? `Firmado ${dateTime(doc.signed_at)}` : 'Pendiente de firma'}</span></td><td>${escapeHtml(doc.asset_tag)}<span class="table-secondary">${escapeHtml(doc.brand)} ${escapeHtml(doc.model)}</span></td><td>${escapeHtml(doc.user_name)}</td><td><span class="status-pill ${signed ? 'status-completed' : 'status-pending'}">${signed ? 'Firmado' : 'Pendiente'}</span></td><td>${!signed && !isStaff ? `<button class="small-button" data-sign-doc="${doc.id}" data-title="${escapeHtml(doc.title)}">Firmar</button>` : signed ? `<button class="small-button" data-doc-receipt="${doc.id}" data-title="${escapeHtml(doc.title)}">Imprimir</button>` : '—'}</td></tr>`; }).join('')}</tbody></table>${documents.length ? '' : emptyState('Sin documentos por ahora', isStaff ? 'Crea una Orden de Servicio o una Solicitud Correctiva.' : 'No tienes documentos pendientes de firma.')}</div></section>`;
 }
 
@@ -657,7 +711,7 @@ async function manageResponsibilityLetters(assetId, assetLabel, assignedUserId =
                 return `<li><div><strong>${escapeHtml(formatPersonName(letter.user_name))} · ${escapeHtml(letter.original_name)}</strong><span>${formatFileSize(letter.file_size)} · ${dateTime(letter.created_at)}</span></div><div class="responsibility-letter-actions"><button type="button" class="small-button" data-preview-letter="${letter.id}" data-letter-name="${escapeHtml(letter.original_name)}" data-letter-mime="${escapeHtml(letter.mime_type)}">Vista previa</button><a class="small-button letter-download" href="${escapeHtml(downloadUrl)}">Descargar</a><button type="button" class="small-button" data-print-letter="${letter.id}">Imprimir</button>${isStaff ? `<button type="button" class="small-button danger-button" data-delete-letter="${letter.id}" data-letter-owner="${escapeHtml(formatPersonName(letter.user_name))}">Eliminar</button>` : ''}</div></li>`;
             }).join('')}</ul>`
             : '<div class="empty-state"><strong>Sin cartas escaneadas</strong><span>Agrega una carta por cada persona que use este activo.</span></div>';
-        const uploadForm = isStaff ? `<form id="responsibility-letter-form" class="responsibility-letter-form"><input type="hidden" name="assetId" value="${escapeHtml(assetId)}"><div class="field"><label for="responsibility-letter-assignee">Persona *</label><select id="responsibility-letter-assignee" name="assigneeId" required>${selectOptions(assignedPeople, 'id', person => formatPersonName(person.name), 'Selecciona persona')}</select><span class="field-help">Cada persona asignada tiene una carta. Al subir otra, reemplaza la anterior.</span></div><div class="field"><label for="responsibility-letter-file">Archivo escaneado *</label><input id="responsibility-letter-file" name="letter" type="file" accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png" required></div><div id="responsibility-letter-preview" class="responsibility-letter-preview hidden" aria-live="polite"></div><div id="responsibility-letter-error" class="form-error" role="alert"></div><div class="form-actions"><button class="secondary-button" type="button" data-close>Cerrar</button><button class="primary-button" type="submit">Subir carta</button></div></form>` : '<div class="form-actions"><button class="secondary-button" type="button" data-close>Cerrar</button></div>';
+        const uploadForm = isStaff ? `<form id="responsibility-letter-form" class="responsibility-letter-form"><input type="hidden" name="assetId" value="${escapeHtml(assetId)}"><div class="field"><input type="hidden" id="responsibility-letter-assignee" name="assigneeId" value="${assignedPeople.length === 1 ? escapeHtml(assignedPeople[0].id) : ''}">${assignedPeople.length > 1 ? '<span class="field-help">Elige la persona con el botón "Subir carta" de su fila. Al subir otra, reemplaza la anterior.</span>' : ''}</div><div class="field"><label for="responsibility-letter-file">Archivo escaneado *</label><input id="responsibility-letter-file" name="letter" type="file" accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png" required></div><div id="responsibility-letter-preview" class="responsibility-letter-preview hidden" aria-live="polite"></div><div id="responsibility-letter-error" class="form-error" role="alert"></div><div class="form-actions"><button class="secondary-button" type="button" data-close>Cerrar</button><button class="primary-button" type="submit">Subir carta</button></div></form>` : '<div class="form-actions"><button class="secondary-button" type="button" data-close>Cerrar</button></div>';
         showModal(`Cartas responsivas · ${assetLabel}`, `<p class="field-help">Cada persona asignada debe tener su propia carta. Archivos PDF, JPG o PNG; máximo 10 MB.</p><section class="responsibility-assignment-section"><h3>Personas asignadas</h3>${assignmentRows}</section><section class="responsibility-files-section"><h3>Cartas cargadas</h3>${letterRows}</section>${uploadForm}`);
         const assigneeSelect = document.querySelector('#responsibility-letter-assignee');
         if (assigneeSelect && assignedUserId) {
@@ -714,6 +768,10 @@ async function manageResponsibilityLetters(assetId, assetLabel, assignedUserId =
             const submitButton = form.querySelector('[type="submit"]');
             const errorRegion = document.querySelector('#responsibility-letter-error');
             errorRegion.textContent = '';
+            if (!form.elements.assigneeId?.value) {
+                errorRegion.textContent = 'Elige la persona con el botón "Subir carta" de su fila.';
+                return;
+            }
             submitButton.disabled = true;
             try {
                 const response = await fetch(new URL('api.php?action=responsibility-letter-upload', window.location.href), {
@@ -774,7 +832,7 @@ function documentFieldsMarkup(formType) {
     const today = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
     const activityChoices = (name, label) => `<tr><th scope="row">${label}</th>${[['done', 'Sí'], ['not_done', 'No'], ['not_applicable', 'N/A']].map(([value, text]) => `<td><label class="fsis-choice" title="${text}"><input type="radio" name="${name}" value="${value}" required><span class="fsis-choice-mark" data-answer="${text}"></span><span class="fsis-choice-label">${text}</span></label></td>`).join('')}</tr>`;
     const satisfaction = `<input class="fsis-rating-manual" type="number" name="satisfaction" min="6" max="10" step="1" required inputmode="numeric" aria-label="Calificacion de satisfaccion de 6 a 10">`;
-    const signatureSection = `<section class="fsis-signatures"><div class="fsis-signature-block"><div class="fsis-name-row"><strong>NOMBRE DEL USUARIO:</strong><span id="document-signed-name" class="fsis-name-value">Selecciona una persona</span><input type="hidden" name="signedName" required></div><div class="fsis-sign-area">${signaturePad('document-user-signature-pad', 'document-clear-user-signature')}<span>FIRMA</span></div></div><div class="fsis-signature-block"><div class="fsis-name-row"><strong>REALIZADO POR:</strong><input name="performedByName" required maxlength="140" value="${escapeHtml(sessionUser.name)}" aria-label="Realizado por"></div><div class="fsis-sign-area">${signaturePad('document-performed-signature-pad', 'document-clear-performed-signature')}<span>FIRMA</span></div></div></section>`;
+    const signatureSection = `<section class="fsis-signatures"><div class="fsis-signature-block"><div class="fsis-name-row"><strong>NOMBRE DEL USUARIO:</strong><input id="document-signed-name" name="signedName" required maxlength="140" autocomplete="off" placeholder="Escribe el nombre" aria-label="Nombre del usuario"></div><div class="fsis-sign-area">${signaturePad('document-user-signature-pad', 'document-clear-user-signature')}<span>FIRMA</span></div></div><div class="fsis-signature-block"><div class="fsis-name-row"><strong>REALIZADO POR:</strong><select name="performedByName" id="document-performed-by" required aria-label="Realizado por"><option value="">Selecciona quién realizó</option>${TECHNICIAN_NAMES.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}</select></div><div class="fsis-sign-area" id="performed-sign-area"><div class="performed-saved hidden" id="performed-saved"><img alt="Firma registrada"><span>FIRMA REGISTRADA</span></div><div class="performed-draw" id="performed-draw">${signaturePad('document-performed-signature-pad', 'document-clear-performed-signature')}<span id="performed-draw-note">FIRMA</span></div></div></div></section>`;
     // La lista de personas se construye desde los nombres que realmente aparecen
     // asignados en ACTIVOS. No se limita a users/asset_users: hay activos importados
     // con nombres completos guardados solo en asset_assignees o source_assignee_name.
@@ -807,14 +865,15 @@ function documentFieldsMarkup(formType) {
     }
     const uniquePeople = [...peopleByName.values()].sort((a,b) => a.name.localeCompare(b.name, 'es-MX'));
     const assetOptions = assetsCache.filter(item => item.type === 'computer' && item.status !== 'retired').sort((a,b) => a.asset_tag.localeCompare(b.asset_tag, 'es-MX'));
-    const assetSelectors = `<div class="fsis-link-selectors fsis-capture-selectors"><label>PERSONA A QUIEN SE REALIZA EL MANTENIMIENTO *<input type="search" id="document-user-search" placeholder="Buscar por nombre..." autocomplete="off"><select name="userId" id="document-user" required><option value="">Selecciona persona</option>${selectOptions(uniquePeople, 'id', person => person.name, '')}</select><span class="field-help" id="document-related-assets">Los equipos relacionados se mostrarán como referencia; puedes elegir cualquier equipo.</span></label><label>EQUIPO AL QUE SE REALIZA EL MANTENIMIENTO *<input type="search" id="document-asset-search" placeholder="Buscar por etiqueta, marca o modelo..." autocomplete="off"><select name="assetId" id="document-asset" required><option value="">Selecciona equipo</option>${selectOptions(assetOptions, 'id', item => `${item.asset_tag} · ${item.brand} ${item.model}`, '')}</select><span class="field-help" id="document-related-people">Las personas asignadas al equipo aparecen aquí sin limitar la selección.</span></label></div>`;
+    const assetSelectors = `<div class="fsis-link-selectors fsis-capture-selectors fsis-asset-picker"><div class="asset-picker-title">EQUIPO AL QUE SE REALIZA EL SERVICIO *</div><div class="asset-search-box"><span aria-hidden="true">⌕</span><input type="search" id="document-asset-search" placeholder="Buscar por etiqueta, marca o modelo (ej. RAS-LT24)" autocomplete="off"></div><select name="assetId" id="document-asset" class="asset-native" required tabindex="-1"><option value="">Selecciona equipo</option>${selectOptions(assetOptions, 'id', item => `${item.asset_tag} · ${item.brand} ${item.model}`, '')}</select><div class="asset-results" id="document-asset-results" role="listbox">${assetOptions.map(item => `<button type="button" class="asset-result" role="option" data-asset-id="${item.id}"><strong>${escapeHtml(item.asset_tag)}</strong><span>${escapeHtml(`${item.brand} ${item.model}`)}</span><em>${escapeHtml(item.department || '')}</em></button>`).join('')}<div class="asset-empty hidden">Sin equipos con esa búsqueda</div></div><span class="field-help" id="document-related-people">Al elegir el equipo se sugiere la persona asignada; puedes escribir otro nombre en la firma.</span></div>`;
     const equipmentDetails = `<section class="fsis-equipment"><div class="fsis-section-tag">DATOS DEL EQUIPO:</div><div class="fsis-equipment-data" id="document-equipment-data"><textarea name="equipmentDetails" rows="5" maxlength="1200" required placeholder="Escribe aquí los datos del equipo: tipo, etiqueta, marca, modelo, número de serie y demás información necesaria."></textarea></div></section>`;
     const assetAndUser = `<section class="fsis-equipment"><div class="fsis-section-tag">DATOS DEL EQUIPO:</div>${assetSelectors}<div class="fsis-equipment-data" id="document-equipment-data"><textarea name="equipmentDetails" rows="5" maxlength="1200" required placeholder="Escribe aquí los datos del equipo: tipo, etiqueta, marca, modelo, número de serie y demás información necesaria."></textarea></div></section>`;
     if (formType === 'service_order') {
-        return `${assetSelectors}<article class="fsis01-sheet" aria-label="Formato F-SIS-01 Rev. 04 Orden de Servicio"><header class="fsis01-header"><img class="fsis01-letterhead" src="assets/fsis01-header.jpg" alt="Encabezado institucional Grupo RAME"><div class="fsis01-title">ORDEN DE SERVICIO</div><span class="fsis01-revision">F-SIS-01 Rev.04</span></header><section class="fsis-meta"><label><strong>FECHA:</strong><input name="date" type="date" value="${today}" required></label><label><strong>DEPARTAMENTO:</strong><input name="department" maxlength="140"></label></section>${equipmentDetails}<section class="fsis-activities"><div class="fsis-section-tag">ACTIVIDADES REALIZADAS</div><table class="fsis-table"><thead><tr><th></th><th>REALIZADAS</th><th>NO REALIZADAS</th><th>NO APLICA</th></tr></thead><tbody>${activityChoices('cleaningExterior', 'LIMPIEZA EXTERIOR')}${activityChoices('cleaningInterior', 'LIMPIEZA INTERIOR')}${activityChoices('systemCleanup', 'DEPURACIÓN DE SISTEMA')}${activityChoices('virusReview', 'REVISIÓN DE VIRUS')}</tbody></table><div class="fsis-password"><strong>CONTRASEÑA DE COMPUTADORA *</strong><input type="text" name="computerPassword" maxlength="120" required autocomplete="off" placeholder="Escribe la contraseña de la computadora"></div></section><section class="fsis-survey"><div class="fsis-section-tag">ENCUESTA DE SATISFACCIÓN</div><p>Favor de Responder de 6 a 10 de acuerdo a la Satisfacción del Servicio, siendo 6 Pésimo, 7 Puede Mejorar, 8 Bueno, 9 Supero mis Expectativas y 10 Excelente.</p><div class="fsis-satisfaction-row"><strong>SATISFACCIÓN DEL MANTENIMIENTO REALIZADO</strong>${satisfaction}</div></section><section class="fsis-comments"><div class="fsis-section-tag">COMENTARIOS O SUGERENCIAS</div><textarea name="comments" maxlength="2000" rows="4" aria-label="Comentarios o sugerencias"></textarea></section>${signatureSection}<footer class="fsis-footer">F-SIS-01 Rev.04</footer></article>`;
+        return `${assetSelectors}<article class="fsis01-sheet" aria-label="Formato F-SIS-01 Rev. 04 Orden de Servicio"><header class="fsis01-header"><img class="fsis01-letterhead" src="assets/fsis01-header.jpg" alt="Encabezado institucional Grupo RAME"><div class="fsis01-title">ORDEN DE SERVICIO</div></header><section class="fsis-meta"><label><strong>FECHA:</strong><input name="date" type="date" value="${today}" required></label><label><strong>DEPARTAMENTO:</strong><input name="department" maxlength="140"></label></section>${equipmentDetails}<section class="fsis-activities"><div class="fsis-section-tag">ACTIVIDADES REALIZADAS</div><table class="fsis-table"><thead><tr><th></th><th>REALIZADAS</th><th>NO REALIZADAS</th><th>NO APLICA</th></tr></thead><tbody>${activityChoices('cleaningExterior', 'LIMPIEZA EXTERIOR')}${activityChoices('cleaningInterior', 'LIMPIEZA INTERIOR')}${activityChoices('systemCleanup', 'DEPURACIÓN DE SISTEMA')}${activityChoices('virusReview', 'REVISIÓN DE VIRUS')}</tbody></table><div class="fsis-password"><strong>CONTRASEÑA DE COMPUTADORA *</strong><input type="text" name="computerPassword" maxlength="120" required autocomplete="off" placeholder="Escribe la contraseña de la computadora"></div></section><section class="fsis-survey"><div class="fsis-section-tag">ENCUESTA DE SATISFACCIÓN</div><p>Favor de Responder de 6 a 10 de acuerdo a la Satisfacción del Servicio, siendo 6 Pésimo, 7 Puede Mejorar, 8 Bueno, 9 Supero mis Expectativas y 10 Excelente.</p><div class="fsis-satisfaction-row"><strong>SATISFACCIÓN DEL MANTENIMIENTO REALIZADO</strong>${satisfaction}</div></section><section class="fsis-comments"><div class="fsis-section-tag">COMENTARIOS O SUGERENCIAS</div><textarea name="comments" maxlength="2000" rows="4" aria-label="Comentarios o sugerencias"></textarea></section>${signatureSection}<footer class="fsis-footer">F-SIS-01 Rev.04</footer></article>`;
     }
-    const correctiveSatisfaction = `<div class="sheet-satisfaction">${[6, 7, 8, 9, 10].map(score => `<label><input type="radio" name="satisfaction" value="${score}" required><span>${score}</span></label>`).join('')}</div>`;
-    return `<article class="word-sheet"><header class="sheet-header"><span>F-SIS-02 · REV. 03</span><h2>Solicitud de Mantenimiento Correctivo a Equipo de Software y Hardware</h2></header><div class="sheet-grid sheet-meta"><label>FECHA *<input name="date" type="date" value="${today}" required></label><label>FECHA DE CIERRE<input name="closingDate" type="date"></label></div>${assetAndUser}<section class="sheet-section"><label class="sheet-wide-field">FALLA QUE PRESENTA *<textarea name="failure" maxlength="2000" required rows="3"></textarea></label><label class="sheet-wide-field">DIAGNÓSTICO *<textarea name="diagnosis" maxlength="2000" required rows="3"></textarea></label><label class="sheet-wide-field">ACTIVIDADES REALIZADAS<textarea name="activities" maxlength="3000" rows="3"></textarea></label></section><section class="sheet-section"><h3>ENCUESTA DE SATISFACCIÓN</h3><p>Favor de responder de 6 a 10 de acuerdo con la satisfacción del servicio.</p>${correctiveSatisfaction}<div class="sheet-grid"><label>TIEMPO DE RESPUESTA<input name="responseTime" maxlength="140"></label></div><label class="sheet-wide-field">SOLUCIÓN QUE SE LE DIO<textarea name="solution" maxlength="2000" rows="3"></textarea></label><label class="sheet-wide-field">COMENTARIOS O SUGERENCIAS<textarea name="comments" maxlength="2000" rows="3"></textarea></label></section>${signatureSection}</article>`;
+    const corrHeader = '<header class="fsis01-header"><img class="fsis01-letterhead" src="assets/fsis01-header.jpg" alt="Encabezado institucional Grupo RAME"><div class="fsis01-title">SOLICITUD DE MANTENIMIENTO CORRECTIVO A EQUIPO DE SOFTWARE Y HARDWARE</div></header>';
+    const corrBlock = (label, name, rows, required = false) => `<section class="fsis-comments"><div class="fsis-section-tag">${label}</div><textarea name="${name}" maxlength="2000" rows="${rows}" ${required ? 'required' : ''} aria-label="${label}"></textarea></section>`;
+    return `${assetSelectors}<article class="fsis01-sheet fsis02-sheet" aria-label="Formato F-SIS-02 Rev. 03 Solicitud de Mantenimiento Correctivo">${corrHeader}<section class="fsis-meta fsis-meta-corrective"><label><strong>FECHA:</strong><input name="date" type="date" value="${today}" required></label><label><strong>FECHA DE CIERRE:</strong><input name="closingDate" type="date"></label><label class="fsis-meta-wide"><strong>DEPARTAMENTO:</strong><input name="department" maxlength="140"></label></section>${equipmentDetails}<div class="fsis-stack">${corrBlock('FALLA QUE PRESENTA *', 'failure', 3, true)}${corrBlock('DIAGNÓSTICO *', 'diagnosis', 3, true)}${corrBlock('ACTIVIDADES REALIZADAS', 'activities', 3)}</div><section class="fsis-survey fsis-survey-corrective"><div class="fsis-section-tag">ENCUESTA DE SATISFACCIÓN</div><p>Favor de Responder de 6 a 10 de acuerdo a la Satisfacción del Servicio, siendo 6 Pésimo, 7 Puede Mejorar, 8 Bueno, 9 Supero mis Expectativas y 10 Excelente.</p><div class="fsis-satisfaction-row"><strong>SATISFACCIÓN DEL SERVICIO</strong>${satisfaction}</div></section><div class="fsis-stack fsis-stack-after">${'<section class="fsis-comments"><div class="fsis-section-tag">TIEMPO DE RESPUESTA</div><input class="fsis-inline-input" name="responseTime" maxlength="140" aria-label="Tiempo de respuesta"></section>'}${corrBlock('SOLUCIÓN QUE SE LE DIO', 'solution', 3)}${corrBlock('COMENTARIOS O SUGERENCIAS', 'comments', 3)}</div>${signatureSection}<footer class="fsis-footer">F-SIS-02 Rev.03</footer></article>`;
 }
 
 function emptyState(title, detail) {
@@ -826,6 +885,7 @@ function bindPageActions() {
     document.querySelectorAll('[data-create]').forEach(button => button.addEventListener('click', () => openCreateForm(button.dataset.create, null, 'service_order', null, button.dataset.assetType || 'computer')));
     document.querySelector('#create-service-order')?.addEventListener('click', () => openCreateForm('documents', null, 'service_order'));
     document.querySelector('#create-corrective-request')?.addEventListener('click', () => openCreateForm('documents', null, 'corrective_request'));
+    document.querySelector('#manage-tech-signatures')?.addEventListener('click', openTechnicianSignatures);
     document.querySelector('#table-search')?.addEventListener('input', filterAssets);
     ['#asset-department-filter', '#asset-status-filter', '#asset-responsibility-filter'].forEach(selector => {
         document.querySelector(selector)?.addEventListener('change', filterAssets);
@@ -868,13 +928,8 @@ function bindPageActions() {
         filterAssets();
     });
     document.querySelector('#maintenance-search')?.addEventListener('input', filterMaintenances);
+    bindMaintenanceProgram();
     document.querySelector('#department-plan-year')?.addEventListener('change', event => { maintenanceCalendarDate = new Date(Number(event.currentTarget.value), maintenanceCalendarDate.getMonth(), 1); renderApp(); });
-    document.querySelectorAll('[data-department-edit-month]').forEach(button => button.addEventListener('click', () => openDepartmentMonthEditor(Number(button.dataset.departmentEditMonth), maintenanceDepartmentPlanCache)));
-    document.querySelectorAll('[data-department-equipment]').forEach(button => button.addEventListener('click', () => openDepartmentDetails(Number(button.dataset.departmentEquipment))));
-    document.querySelectorAll('[data-department-notify]').forEach(button => button.addEventListener('click', () => {
-        const plan = maintenanceDepartmentPlanCache?.plans.find(item => Number(item.id) === Number(button.dataset.departmentNotify));
-        openDepartmentDetails(Number(button.dataset.departmentNotify), plan?.request_status !== 'confirmed');
-    }));
     document.querySelector('#maintenance-status-filter')?.addEventListener('change', filterMaintenances);
     document.querySelector('#maintenance-calendar-prev')?.addEventListener('click', () => {
         maintenanceCalendarDate = maintenanceCalendarView === 'month'
@@ -920,6 +975,8 @@ function bindPageActions() {
     document.querySelectorAll('[data-cancel-maintenance]').forEach(button => button.addEventListener('click', () => cancelMaintenance(button.dataset.cancelMaintenance)));
     document.querySelectorAll('[data-sign-doc]').forEach(button => button.addEventListener('click', () => openDocumentSign(button.dataset.signDoc, button.dataset.title)));
     document.querySelectorAll('[data-receipt]').forEach(button => button.addEventListener('click', () => printMaintenance(button.dataset.receipt)));
+    document.querySelectorAll('[data-annual-preview]').forEach(button => button.addEventListener('click', () => printSimpleDocument({ docReceipt: button.dataset.annualPreview })));
+    document.querySelectorAll('[data-annual-print]').forEach(button => button.addEventListener('click', () => printSimpleDocument({ docReceipt: button.dataset.annualPrint, autoPrint: true })));
     document.querySelectorAll('[data-doc-receipt]').forEach(button => button.addEventListener('click', () => printSimpleDocument(button.dataset)));
     document.querySelectorAll('[data-delete-doc]').forEach(button => button.addEventListener('click', () => deleteDocument(button.dataset.deleteDoc, button.dataset.title)));
     if (currentRoute === 'documents' && ['admin', 'technician'].includes(sessionUser.role)) void addDocumentDeleteButtons();
@@ -1038,7 +1095,7 @@ function openCreateForm(route, record = null, documentFormType = 'service_order'
     ].map(name => String(name || '').replace(/\s+/g, ' ').trim()).filter(name => name && !['sin asignar', 'sin asignado'].includes(nameKey(name))))];
     if (route === 'assets') {
         title = 'Registrar activo';
-        fields = `<div class="field"><label>Etiqueta de inventario *</label><input name="assetTag" required maxlength="80" placeholder="TI-0248"></div><div class="field"><label>Tipo *</label><select name="type" id="asset-type"><option value="computer">Computadora</option><option value="phone">Celular</option><option value="tablet">Tableta</option><option value="other">Otro</option></select></div><div class="field hidden" id="phone-category-field"><label>Clasificación del celular *</label><select name="phoneCategory"><option value="">Selecciona clasificación</option><option value="administrative">Administrativo</option><option value="operational">Operacional</option></select></div><div class="field hidden" id="phone-format-field"><label>Estado del celular *</label><select name="phoneFormatStatus"><option value="">Selecciona estado</option><option value="active">Activo</option><option value="formatted">Formateado</option><option value="to_format">Por formatear</option></select></div><div class="field"><label>Marca *</label><input name="brand" required maxlength="100" placeholder="Lenovo"></div><div class="field"><label>Modelo *</label><input name="model" required maxlength="120" placeholder="ThinkPad E14"></div><div class="field"><label>Número de serie</label><input name="serialNumber" maxlength="150"></div><div class="field"><label>Usuario de Windows</label><input name="windowsUsername" maxlength="190" autocomplete="off"></div><div class="field full"><label>Contraseña de Windows / RDP</label><input name="windowsPassword" type="password" maxlength="4096" autocomplete="new-password"><span class="field-help">Se guarda sin cifrar en la base de datos. Al editar, déjala vacía para conservar la contraseña actual.</span>${record ? '<label><input name="clearWindowsPassword" type="checkbox" value="1"> Eliminar la contraseña guardada</label>' : ''}</div><div class="field"><label>Estado</label><select name="status"><option value="assigned">Activo</option><option value="available" selected>Disponible</option><option value="maintenance">En mantenimiento</option><option value="retired">Dado de baja</option></select></div><div class="field"><label>Persona asignada</label><select name="assignedUserId">${selectOptions(peopleCache, 'id', person => person.name, 'Sin asignar')}</select></div><div class="field"><label>Fecha de asignación</label><input name="assignedDate" type="date"></div><div class="field"><label>Departamento</label><input name="department" maxlength="140"></div><div class="field"><label>Puesto</label><input name="position" maxlength="140"></div><div class="field"><label>Vencimiento de garantía</label><input name="warrantyUntil" type="date"></div><div class="field"><label>Terminal</label><input name="terminal" maxlength="190"></div><div class="field"><label>Monitor</label><input name="monitor" maxlength="160"></div><div class="field"><label>Mouse</label><input name="mouse" maxlength="160"></div><div class="field full"><label>RDP (equipo/host)</label><input name="rdpAccess" maxlength="190"></div><div class="field full"><label>Notas</label><textarea name="notes" maxlength="2000"></textarea></div>`;
+        fields = `<div class="field"><label>Etiqueta de inventario *</label><input name="assetTag" required maxlength="80" placeholder="RAS-LT01 / RAS-PC01"></div><input type="hidden" name="type" id="asset-type" value="computer"><div class="field hidden" id="phone-category-field"><label>Clasificación del celular *</label><select name="phoneCategory"><option value="">Selecciona clasificación</option><option value="administrative">Administrativo</option><option value="operational">Operacional</option></select></div><div class="field hidden" id="phone-format-field"><label>Estado del celular *</label><select name="phoneFormatStatus"><option value="">Selecciona estado</option><option value="active">Activo</option><option value="formatted">Formateado</option><option value="to_format">Por formatear</option></select></div><div class="field"><label>Marca *</label><input name="brand" required maxlength="100" placeholder="Lenovo"></div><div class="field"><label>Modelo *</label><input name="model" required maxlength="120" placeholder="ThinkPad E14"></div><div class="field"><label>Número de serie</label><input name="serialNumber" maxlength="150"></div><div class="field"><label>Antivirus</label><input name="antivirusProduct" maxlength="160"></div><div class="field"><label>Vencimiento del antivirus</label><input name="antivirusExpiresOn" type="date"></div><div class="field"><label>Usuario de Windows</label><input name="windowsUsername" maxlength="190" autocomplete="off"></div><div class="field"><label>Contraseña de Windows</label><input name="windowsPassword" type="text" maxlength="4096" autocomplete="off"></div><div class="field"><label>RDP (equipo/host)</label><input name="rdpAccess" maxlength="190"></div><div class="field"><label>Estado</label><select name="status"><option value="assigned">Activo</option><option value="available" selected>Disponible</option><option value="maintenance">En mantenimiento</option><option value="retired">Dado de baja</option></select></div><div class="field"><label>Departamento</label><select name="department"><option value="">Selecciona departamento</option>${[...new Set([...ASSET_DEPARTMENTS, ...(record?.department ? [record.department] : [])])].map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}</select></div><div class="field"><label>Puesto</label><input name="position" maxlength="140"></div><div class="field"><label>Vencimiento de garantía</label><input name="warrantyUntil" type="date"></div><div class="field"><label>Monitor</label><input name="monitor" maxlength="160"></div><div class="field"><label>Mouse</label><input name="mouse" maxlength="160"></div><div class="field full"><label>Personas asignadas (máximo 5)</label><textarea name="assigneeNamesText" rows="3" maxlength="800" placeholder="Escribe un nombre por línea"></textarea></div><div class="field full"><label>Notas</label><textarea name="notes" maxlength="2000" rows="2"></textarea></div>`;
     } else if (route === 'licenses') {
         title = 'Registrar licencia';
         fields = `<div class="field"><label>Producto *</label><input name="product" required maxlength="160" placeholder="Microsoft 365"></div><div class="field"><label>Proveedor</label><input name="vendor" maxlength="140"></div><div class="field"><label>Asientos disponibles *</label><input name="seats" type="number" min="1" value="1" required></div><div class="field"><label>Activaciones en uso</label><input name="activations" type="number" min="0" value="0"></div><div class="field"><label>Vence el</label><input name="expiresOn" type="date"></div><div class="field"><label>Estado</label><select name="status"><option value="active">Activa</option><option value="expiring">Por vencer</option><option value="inactive">Inactiva</option><option value="expired">Vencida</option></select></div><div class="field full"><label>Clave de activación</label><input name="activationKey" type="password" autocomplete="new-password"><span class="field-help">Se cifra en el servidor; al editar, dejar en blanco conserva la clave guardada.</span></div><div class="field full"><label>Notas</label><textarea name="notes" maxlength="2000" placeholder="No incluyas claves de activación en este campo"></textarea></div>`;
@@ -1102,13 +1159,9 @@ function openCreateForm(route, record = null, documentFormType = 'service_order'
         hiddenType.name = 'type';
         hiddenType.value = record?.type || assetType;
         typeField.replaceWith(hiddenType);
-        const assigneeSelect = document.querySelector('#create-form [name="assignedUserId"]');
-        assigneeSelect.name = 'assignedUserIds';
-        assigneeSelect.multiple = true;
-        assigneeSelect.size = 5;
-        assigneeSelect.setAttribute('aria-label', 'Personas asignadas, máximo cinco');
-        assigneeSelect.closest('.field').querySelector('label').textContent = 'Personas asignadas (máximo 5)';
-        document.querySelector('#create-form [name="serialNumber"]').closest('.field').insertAdjacentHTML('afterend', '<div class="field"><label>Antivirus</label><input name="antivirusProduct" maxlength="160"></div><div class="field"><label>Vencimiento del antivirus</label><input name="antivirusExpiresOn" type="date"></div>');
+        const assigneeInput = document.querySelector('#create-form [name="assigneeNamesText"]');
+        if (record) assigneeInput.value = (record.assignees || []).map(person => person.name).join('\n');
+        document.querySelector('#modal-root .modal').classList.add('asset-modal');
     }
     if (route === 'licenses') {
         document.querySelector('#create-form [name="seats"]').insertAdjacentHTML('afterend', '<label><input type="checkbox" name="seatsConfirmed" value="1" checked> Capacidad contratada confirmada</label>');
@@ -1118,10 +1171,8 @@ function openCreateForm(route, record = null, documentFormType = 'service_order'
         if (maintenanceRecord) {
             document.querySelector('#modal-root .modal-head h2').textContent = 'Firmar Orden de Servicio · Cerrar mantenimiento';
             document.querySelector('#create-form .primary-button').textContent = 'Firmar y cerrar mantenimiento';
-            const personSelect = document.querySelector('#document-user');
-            const normalizeName = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase('es-MX');
-            const personOption = [...personSelect.options].find(option => normalizeName(option.textContent) === normalizeName(maintenanceRecord.personName));
-            personSelect.value = personOption?.value || '';
+            const signedNameInput = document.querySelector('[name="signedName"]');
+            if (signedNameInput) signedNameInput.value = maintenanceRecord.personName || '';
             document.querySelector('#document-asset').value = String(maintenanceRecord.assetId);
         }
     }
@@ -1137,14 +1188,16 @@ function openCreateForm(route, record = null, documentFormType = 'service_order'
         if (route === 'licenses') {
             document.querySelector('#create-form [name="seatsConfirmed"]').checked = Number(record.seats_confirmed) === 1;
         }
-        if (route === 'assets') {
-            const assigneeSelect = document.querySelector('#create-form [name="assignedUserIds"]');
-            const assignedIds = (record.assigned_user_ids || []).map(Number);
-            [...assigneeSelect.options].forEach(option => {
-                option.selected = assignedIds.includes(Number(option.value));
-            });
-        }
         document.querySelector('#modal-root .modal-head h2').textContent = route === 'assets' ? 'Editar activo' : 'Actualizar licencia';
+        if (route === 'assets' && sessionUser.role === 'admin' && Number(record.has_windows_password)) {
+            const passwordInput = document.querySelector('#create-form [name="windowsPassword"]');
+            passwordInput.disabled = true;
+            passwordInput.placeholder = 'Cargando…';
+            api('asset-password', { method: 'POST', body: { id: record.id } })
+                .then(result => { passwordInput.value = result.password || ''; passwordInput.dataset.loaded = '1'; })
+                .catch(() => {})
+                .finally(() => { passwordInput.disabled = false; passwordInput.placeholder = ''; });
+        }
         document.querySelector('#create-form .primary-button').textContent = 'Guardar cambios';
     }
     if (route === 'documents') {
@@ -1152,127 +1205,102 @@ function openCreateForm(route, record = null, documentFormType = 'service_order'
             user: initSignature('document-user-signature-pad', 'document-clear-user-signature'),
             performedBy: initSignature('document-performed-signature-pad', 'document-clear-performed-signature'),
         };
+        const syncPerformedBy = () => {
+            const select = document.querySelector('#document-performed-by');
+            const saved = technicianSignatures[select?.value];
+            const savedBox = document.querySelector('#performed-saved');
+            const drawBox = document.querySelector('#performed-draw');
+            if (!select || !savedBox || !drawBox) return;
+            savedBox.classList.toggle('hidden', !saved);
+            drawBox.classList.toggle('hidden', Boolean(saved));
+            if (saved) { const img = savedBox.querySelector('img'); img.src = saved; img.alt = `Firma de ${select.value}`; }
+            document.querySelector('#performed-draw-note').textContent = select.value ? 'SIN FIRMA REGISTRADA · FIRMA AQUÍ' : 'FIRMA';
+        };
+        const bindPerformedBy = () => {
+            const select = document.querySelector('#document-performed-by');
+            if (!select) return;
+            select.addEventListener('change', syncPerformedBy);
+            const mine = [...select.options].find(option => nameKey(option.value) === nameKey(sessionUser.name));
+            if (mine) select.value = mine.value;
+            syncPerformedBy();
+        };
+        bindPerformedBy();
+        api('technician-signatures').then(({ technicians }) => {
+            technicianSignatures = Object.fromEntries(technicians.filter(item => item.signature).map(item => [item.name, item.signature]));
+            syncPerformedBy();
+        }).catch(() => {});
         const syncDocumentIdentity = () => {
-            const userSelect = document.querySelector('#document-user');
-            const assetSelect = document.querySelector('#document-asset');
-            const selectedPersonName = userSelect?.value
-                ? userSelect.selectedOptions[0]?.textContent || ''
-                : '';
-            const asset = assetsCache.find(item => String(item.id) === assetSelect?.value);
+            const asset = assetsCache.find(item => String(item.id) === document.querySelector('#document-asset')?.value);
             const signedName = document.querySelector('[name="signedName"]');
-            const signedNameDisplay = document.querySelector('#document-signed-name');
             const department = document.querySelector('[name="department"]');
             const equipmentDetails = document.querySelector('[name="equipmentDetails"]');
-            const normalizeName = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase('es-MX');
-            const assignedNames = item => [...new Set([
-                ...(Array.isArray(item?.assigned_users) ? item.assigned_users : []),
-                ...(Array.isArray(item?.assignees) ? item.assignees.flatMap(person => [person.name, person.account_name]) : []),
-                ...String(item?.assigned_name || '').split(/[\r\n;,|]+/),
-                ...String(item?.source_assignee_name || '').split(/[\r\n;,|]+/),
-            ].map(name => String(name || '').replace(/\s+/g, ' ').trim()).filter(Boolean))];
-            const relatedAssets = assetsCache.filter(item => assignedNames(item).some(name => normalizeName(name) === normalizeName(selectedPersonName)));
-            const relatedNames = asset ? assignedNames(asset) : [];
+            const names = asset ? assignedNames(asset) : [];
             const generatedDetails = asset ? [
                 `CÓDIGO DE EQUIPO: ${asset.asset_tag || '—'}`,
                 `MODELO: ${[asset.brand, asset.model].filter(Boolean).join(' ') || '—'}`,
                 `NÚMERO DE SERIE / SERVICE TAG: ${asset.serial_number || '—'}`,
             ].join('\n') : '';
-            const relatedAssetsHint = document.querySelector('#document-related-assets');
-            const relatedPeopleHint = document.querySelector('#document-related-people');
-            if (signedName) signedName.value = selectedPersonName;
-            if (signedNameDisplay) signedNameDisplay.textContent = selectedPersonName || 'Selecciona una persona';
             if (asset && department) department.value = asset.department || '';
             if (equipmentDetails && (!equipmentDetails.value || equipmentDetails.value === equipmentDetails.dataset.assetAutofill)) {
                 equipmentDetails.value = generatedDetails;
                 equipmentDetails.dataset.assetAutofill = generatedDetails;
             }
-            if (relatedAssetsHint) relatedAssetsHint.textContent = selectedPersonName ? (relatedAssets.length ? `Equipos relacionados: ${relatedAssets.map(item => item.asset_tag).join(', ')}. Puedes seleccionar otro equipo.` : 'Sin equipos relacionados registrados; puedes seleccionar cualquier equipo.') : 'Los equipos relacionados se mostrarán como referencia; puedes elegir cualquier equipo.';
-            if (relatedPeopleHint) relatedPeopleHint.textContent = asset ? (relatedNames.length ? `Personas asignadas en Activos: ${relatedNames.join(', ')}. Puedes seleccionar otra persona.` : 'Este equipo no tiene personas asignadas registradas.') : 'Las personas asignadas al equipo aparecen aquí sin limitar la selección.';
-        };
-        const filterSearchableSelect = (searchInput, select) => {
-            const query = searchInput.value.trim().toLocaleLowerCase('es-MX').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-            const selectedValue = select.value;
-            for (const option of [...select.options]) {
-                if (!option.value) { option.hidden = false; continue; }
-                const label = option.textContent.toLocaleLowerCase('es-MX').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-                option.hidden = Boolean(query) && !label.includes(query);
+            if (signedName && asset && signedName.dataset.autofillAsset !== String(asset.id)) {
+                signedName.value = names.join(', ');
+                signedName.dataset.autofill = signedName.value;
+                signedName.dataset.autofillAsset = String(asset.id);
+            } else if (signedName && !asset) {
+                delete signedName.dataset.autofillAsset;
             }
-            if (selectedValue && [...select.options].some(option => option.value === selectedValue && !option.hidden)) select.value = selectedValue;
-            else if (query) select.value = '';
+            document.querySelectorAll('#document-asset-results .asset-result').forEach(button => button.classList.toggle('active', Boolean(asset) && button.dataset.assetId === String(asset.id)));
+            const hint = document.querySelector('#document-related-people');
+            if (hint) hint.textContent = asset ? (names.length ? `Tomado de la etiqueta en Activos: ${names.join(', ')}. Puedes corregirlo en la firma.` : 'Este equipo no tiene persona asignada; escribe el nombre en la firma.') : 'Al elegir el equipo se sugiere la persona asignada; puedes escribir otro nombre en la firma.';
         };
-        const userSearch = document.querySelector('#document-user-search');
-        const assetSearch = document.querySelector('#document-asset-search');
-        const userSelect = document.querySelector('#document-user');
-        const assetSelect = document.querySelector('#document-asset');
-        userSearch?.addEventListener('input', () => filterSearchableSelect(userSearch, userSelect));
-        assetSearch?.addEventListener('input', () => filterSearchableSelect(assetSearch, assetSelect));
-        userSelect.addEventListener('change', syncDocumentIdentity);
-        assetSelect.addEventListener('change', () => {
-            const asset = assetsCache.find(item => String(item.id) === assetSelect.value);
-            const names = asset ? [...new Set([
-                ...(Array.isArray(asset.assigned_users) ? asset.assigned_users : []),
-                ...(Array.isArray(asset.assignees) ? asset.assignees.flatMap(person => [person.name, person.account_name]) : []),
-                ...String(asset.assigned_name || '').split(/[\r\n;,|]+/),
-                ...String(asset.source_assignee_name || '').split(/[\r\n;,|]+/),
-            ].map(name => String(name || '').trim()).filter(Boolean))] : [];
-            const matchingPerson = [...userSelect.options].find(option => option.value && names.some(name => nameKey(name) === nameKey(option.textContent)));
-            if (matchingPerson) userSelect.value = matchingPerson.value;
-            syncDocumentIdentity();
-        });
-        userSelect.addEventListener('change', () => {
-            const selectedName = userSelect.selectedOptions[0]?.textContent || '';
-            const matches = assetsCache.filter(item => item.type === 'computer' && item.status !== 'retired' && [
-                ...(Array.isArray(item.assigned_users) ? item.assigned_users : []),
-                ...(Array.isArray(item.assignees) ? item.assignees.flatMap(person => [person.name, person.account_name]) : []),
-                ...String(item.assigned_name || '').split(/[\r\n;,|]+/),
-                ...String(item.source_assignee_name || '').split(/[\r\n;,|]+/),
-            ].some(name => nameKey(name) === nameKey(selectedName)));
-            if (matches.length === 1) assetSelect.value = String(matches[0].id);
-            syncDocumentIdentity();
-        });
+        const filterAssetSelect = (searchInput, select) => {
+            const fold = value => String(value || '').toLocaleLowerCase('es-MX').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+            const query = fold(searchInput.value.trim());
+            let shown = 0;
+            document.querySelectorAll('#document-asset-results .asset-result').forEach(button => {
+                const match = Boolean(query) && fold(button.textContent).includes(query);
+                button.hidden = !match;
+                if (match) shown += 1;
+            });
+            document.querySelector('#document-asset-results .asset-empty')?.classList.toggle('hidden', !query || shown > 0);
+            document.querySelector('#document-asset-results')?.classList.toggle('open', Boolean(query));
+        };
+        const bindAssetPicker = () => {
+            const search = document.querySelector('#document-asset-search');
+            const select = document.querySelector('#document-asset');
+            search?.addEventListener('input', () => filterAssetSelect(search, select));
+            search?.addEventListener('keydown', event => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                document.querySelector('#document-asset-results .asset-result:not([hidden])')?.click();
+            });
+            document.querySelectorAll('#document-asset-results .asset-result').forEach(button => button.addEventListener('click', () => {
+                select.value = button.dataset.assetId;
+                search.value = button.querySelector('strong').textContent;
+                document.querySelector('#document-asset-results')?.classList.remove('open');
+                select.dispatchEvent(new Event('change'));
+            }));
+            select?.addEventListener('change', syncDocumentIdentity);
+        };        bindAssetPicker();
         document.querySelector('#document-form-type')?.addEventListener('change', event => {
-            const selectedUser = document.querySelector('#document-user').value;
             const selectedAsset = document.querySelector('#document-asset').value;
+            const selectedName = document.querySelector('[name="signedName"]')?.value || '';
             document.querySelector('#document-form-fields').innerHTML = documentFieldsMarkup(event.currentTarget.value);
-            document.querySelector('#document-user').value = selectedUser;
             documentSignatures = {
                 user: initSignature('document-user-signature-pad', 'document-clear-user-signature'),
                 performedBy: initSignature('document-performed-signature-pad', 'document-clear-performed-signature'),
             };
-            const newUserSearch = document.querySelector('#document-user-search');
-            const newAssetSearch = document.querySelector('#document-asset-search');
-            const newUserSelect = document.querySelector('#document-user');
-            const newAssetSelect = document.querySelector('#document-asset');
-            newUserSearch?.addEventListener('input', () => filterSearchableSelect(newUserSearch, newUserSelect));
-            newAssetSearch?.addEventListener('input', () => filterSearchableSelect(newAssetSearch, newAssetSelect));
-            newUserSelect.addEventListener('change', () => {
-                const selectedName = newUserSelect.selectedOptions[0]?.textContent || '';
-                const matches = assetsCache.filter(item => item.type === 'computer' && item.status !== 'retired' && [
-                    ...(Array.isArray(item.assigned_users) ? item.assigned_users : []),
-                    ...(Array.isArray(item.assignees) ? item.assignees.flatMap(person => [person.name, person.account_name]) : []),
-                    ...String(item.assigned_name || '').split(/[\r\n;,|]+/),
-                    ...String(item.source_assignee_name || '').split(/[\r\n;,|]+/),
-                ].some(name => nameKey(name) === nameKey(selectedName)));
-                if (matches.length === 1) newAssetSelect.value = String(matches[0].id);
-                syncDocumentIdentity();
-            });
-            newAssetSelect.addEventListener('change', () => {
-                const asset = assetsCache.find(item => String(item.id) === newAssetSelect.value);
-                const names = asset ? [
-                    ...(Array.isArray(asset.assigned_users) ? asset.assigned_users : []),
-                    ...(Array.isArray(asset.assignees) ? asset.assignees.flatMap(person => [person.name, person.account_name]) : []),
-                    ...String(asset.assigned_name || '').split(/[\r\n;,|]+/),
-                    ...String(asset.source_assignee_name || '').split(/[\r\n;,|]+/),
-                ] : [];
-                const matchingPerson = [...newUserSelect.options].find(option => option.value && names.some(name => nameKey(name) === nameKey(option.textContent)));
-                if (matchingPerson) newUserSelect.value = matchingPerson.value;
-                syncDocumentIdentity();
-            });
+            bindAssetPicker();
+            const performedBefore = document.querySelector('#document-performed-by')?.value || '';
+            bindPerformedBy();
+            if (performedBefore) { document.querySelector('#document-performed-by').value = performedBefore; syncPerformedBy(); }
+            if (selectedAsset && [...assetSelect.options].some(option => option.value === selectedAsset)) assetSelect.value = selectedAsset;
+            const nameInput = document.querySelector('[name="signedName"]');
+            if (nameInput) { nameInput.value = selectedName; if (selectedAsset) nameInput.dataset.autofillAsset = selectedAsset; }
             syncDocumentIdentity();
-            if (selectedAsset && [...document.querySelector('#document-asset').options].some(option => option.value === selectedAsset)) {
-                document.querySelector('#document-asset').value = selectedAsset;
-                syncDocumentIdentity();
-            }
         });
         syncDocumentIdentity();
     }
@@ -1290,7 +1318,13 @@ function openCreateForm(route, record = null, documentFormType = 'service_order'
         const formEntries = new FormData(event.currentTarget);
         const formData = Object.fromEntries(formEntries.entries());
         if (record) formData.id = record.id;
-        if (route === 'assets') formData.assignedUserIds = formEntries.getAll('assignedUserIds').map(Number);
+        if (route === 'assets') {
+            // Si la contraseña se cargó y se vació, se interpreta como borrarla.
+            const passwordInput = document.querySelector('#create-form [name="windowsPassword"]');
+            if (passwordInput.dataset.loaded === '1' && passwordInput.value === '') formData.clearWindowsPassword = '1';
+            formData.assigneeNames = [...new Set(String(formData.assigneeNamesText || '').split(/[\r\n;]+/).map(name => name.trim().toLocaleUpperCase('es-MX')).filter(Boolean))].slice(0, 5);
+            delete formData.assigneeNamesText;
+        }
         if (route === 'licenses') formData.seatsConfirmed = Number(formEntries.has('seatsConfirmed'));
         if (route === 'maintenance') {
             formData.scheduledAt = `${formData.scheduledDate} ${formData.scheduledTime}`;
@@ -1317,7 +1351,20 @@ function openCreateForm(route, record = null, documentFormType = 'service_order'
             const result = await api(action, { method: 'POST', body: formData });
             closeModal();
             if (route === 'maintenance') {
-                toast(result.message || 'Servicio guardado en la agenda.');
+                const emailMessage = result.emailMessage || 'No se confirmó el envío por correo.';
+                showModal('Invitación de mantenimiento', `<div class="notice ${result.emailSent ? '' : 'error'}"><span>${result.emailSent ? '✓' : '!'}</span><div>${escapeHtml(emailMessage)}</div></div><div class="field full"><label for="manual-maintenance-invitation">Invitación para compartir manualmente</label><textarea id="manual-maintenance-invitation" rows="7" readonly>${escapeHtml(result.manualInvitation || '')}</textarea></div><div class="form-actions"><button type="button" class="secondary-button" id="copy-maintenance-invitation">Copiar invitación</button><button type="button" class="primary-button" data-close>Listo</button></div>`);
+                document.querySelector('#copy-maintenance-invitation')?.addEventListener('click', async () => {
+                    const invitation = document.querySelector('#manual-maintenance-invitation');
+                    try {
+                        if (!navigator.clipboard?.writeText) throw new Error('Portapapeles no disponible');
+                        await navigator.clipboard.writeText(invitation.value);
+                        toast('Invitación copiada al portapapeles.');
+                    } catch (error) {
+                        invitation.focus();
+                        invitation.select();
+                        toast('No se pudo copiar automáticamente. Selecciona y copia el texto.');
+                    }
+                });
             }
             else toast(maintenanceRecord ? 'Orden de Servicio firmada y guardada; mantenimiento cerrado.' : route === 'documents' ? 'Formato guardado con las dos firmas.' : 'Registro guardado.');
             await renderApp();
@@ -1344,15 +1391,6 @@ function showModal(title, body) {
 }
 
 function closeModal() { document.querySelector('#modal-root')?.remove(); }
-
-function showInviteLink(message, inviteUrl) {
-    toast(message, 'error');
-    showModal('Enlace listo para compartir', `<div class="notice"><span>!</span><div><strong>La agenda se actualizó</strong>${escapeHtml(message)} Copia el enlace y envíaselo al usuario por un canal seguro.</div></div><div class="field"><label>Enlace de confirmación</label><input id="invite-link" readonly value="${escapeHtml(inviteUrl)}"></div><div class="form-actions"><button type="button" class="secondary-button" data-close>Cerrar</button><button type="button" class="primary-button" id="copy-invite">Copiar enlace</button></div>`);
-    document.querySelector('#copy-invite').addEventListener('click', async () => {
-        const link = document.querySelector('#invite-link');
-        try { await navigator.clipboard.writeText(link.value); toast('Enlace copiado.'); } catch { link.select(); document.execCommand('copy'); toast('Enlace copiado.'); }
-    });
-}
 
 function showMaintenanceDetails(id) {
     const item = maintenanceCache.find(record => String(record.id) === String(id));
@@ -1408,10 +1446,9 @@ async function cancelMaintenance(id) {
 
 async function approveReschedule(id) {
     try {
-        const result = await api('maintenance-approve', { method: 'POST', body: { id } });
+        await api('maintenance-approve', { method: 'POST', body: { id } });
         await renderApp();
-        if (!result.emailSent && result.inviteUrl) showInviteLink(result.emailMessage, result.inviteUrl);
-        else toast(result.emailMessage);
+        toast('Reprogramación aprobada.');
     } catch (error) { toast(error.message, 'error'); }
 }
 
@@ -1459,13 +1496,62 @@ function initSignature(padId = 'signature-pad', clearId = 'clear-signature') {
     context.lineCap = 'round';
     let drawing = false;
     let hasInk = false;
-    const point = event => { const rect = canvas.getBoundingClientRect(); return { x: event.clientX - rect.left, y: event.clientY - rect.top }; };
+    const point = event => { const rect = canvas.getBoundingClientRect(); return { x: (event.clientX - rect.left) * (canvas.width / scale / rect.width), y: (event.clientY - rect.top) * (canvas.height / scale / rect.height) }; };
     canvas.addEventListener('pointerdown', event => { drawing = true; canvas.setPointerCapture(event.pointerId); const p = point(event); context.beginPath(); context.moveTo(p.x, p.y); });
     canvas.addEventListener('pointermove', event => { if (!drawing) return; const p = point(event); context.lineTo(p.x, p.y); context.stroke(); hasInk = true; });
     canvas.addEventListener('pointerup', () => { drawing = false; });
     canvas.addEventListener('pointercancel', () => { drawing = false; });
-    document.getElementById(clearId).addEventListener('click', () => { context.clearRect(0, 0, canvas.width, canvas.height); hasInk = false; });
+    document.getElementById(clearId).addEventListener('click', () => {
+        drawing = false;
+        context.save();
+        context.setTransform(1, 0, 0, 1, 0, 0);
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.restore();
+        context.beginPath();
+        hasInk = false;
+    });
     return () => hasInk ? canvas.toDataURL('image/png') : '';
+}
+
+async function openTechnicianSignatures() {
+    const { technicians } = await api('technician-signatures');
+    technicianSignatures = Object.fromEntries(technicians.filter(item => item.signature).map(item => [item.name, item.signature]));
+    const rows = technicians.map((item, index) => `<section class="tech-sign-row" data-name="${escapeHtml(item.name)}"><h4>${escapeHtml(item.name)}</h4><div class="tech-sign-current">${item.signature ? `<img src="${item.signature}" alt="Firma registrada"><span>Firma registrada</span>` : '<span>Sin firma registrada</span>'}</div><label class="tech-sign-upload">Subir imagen de la firma (PNG, JPG o WEBP)<input type="file" accept="image/png,image/jpeg,image/webp" data-file="${index}"></label><div class="form-actions"><button type="button" class="secondary-button" data-remove="${index}">Quitar firma</button><button type="button" class="primary-button" data-save="${index}">Guardar firma</button></div></section>`).join('');
+    showModal('Firmas del personal TI', `<div class="tech-sign-list">${rows}</div><div class="form-actions"><button type="button" class="secondary-button" data-close>Cerrar</button></div>`);
+    const imageToPng = file => new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+            const ratio = Math.min(1, 600 / img.width, 200 / img.height);
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(img.width * ratio));
+            canvas.height = Math.max(1, Math.round(img.height * ratio));
+            canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+            URL.revokeObjectURL(url);
+            resolve(canvas.toDataURL('image/png'));
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('No se pudo leer la imagen.')); };
+        img.src = url;
+    });
+    const pads = technicians.map((_, index) => () => {
+        const file = document.querySelector(`[data-file="${index}"]`).files[0];
+        return file ? imageToPng(file) : Promise.resolve('');
+    });
+    const save = async (index, signature) => {
+        try {
+            const result = await api('technician-signature-save', { method: 'POST', body: { name: technicians[index].name, signature } });
+            toast(result.message || 'Listo');
+            openTechnicianSignatures();
+        } catch (error) { toast(error.message); }
+    };
+    document.querySelectorAll('[data-save]').forEach(button => button.addEventListener('click', async () => {
+        try {
+            const signature = await pads[Number(button.dataset.save)]();
+            if (!signature) { toast('Selecciona la imagen de la firma antes de guardar.'); return; }
+            save(Number(button.dataset.save), signature);
+        } catch (error) { toast(error.message); }
+    }));
+    document.querySelectorAll('[data-remove]').forEach(button => button.addEventListener('click', () => save(Number(button.dataset.remove), '')));
 }
 
 function openDocumentSign(id, title) {
@@ -1503,6 +1589,7 @@ async function printSimpleDocument(data) {
         bindDocumentPreviewZoom();
         document.querySelector('#print-receipt').addEventListener('click', () => window.print());
         document.querySelector('#download-fsis01')?.addEventListener('click', () => downloadServiceOrderDocx(data.docReceipt));
+        if (data.autoPrint) setTimeout(() => window.print(), 300);
     } catch (error) { toast(error.message, 'error'); }
 }
 
@@ -1559,12 +1646,10 @@ function digitalFormReceipt(receipt) {
     const selectedPerson = receipt.signedName || receipt.user || '';
     const signatureBlock = (name, image, label) => `<div class="fsis-signature-block"><div class="fsis-name-row"><strong>${label}:</strong>${staticValue(name)}</div><div class="fsis-sign-area fsis-sign-area-static"><img class="fsis-signature-image" src="${image}" alt="Firma de ${esc(name)}"><span>FIRMA</span></div></div>`;
     if (receipt.formType === 'service_order') {
-        return `<article class="receipt digital-form-receipt"><article class="fsis01-sheet fsis01-receipt" aria-label="F-SIS-01 Rev. 04 Orden de Servicio"><header class="fsis01-header"><img class="fsis01-letterhead" src="assets/fsis01-header.jpg" alt="Encabezado institucional Grupo RAME"><div class="fsis01-title">ORDEN DE SERVICIO</div><span class="fsis01-revision">F-SIS-01 Rev.04</span></header><section class="fsis-meta">${metaField('FECHA', values.date)}${metaField('DEPARTAMENTO', values.department)}</section><section class="fsis-equipment"><div class="fsis-section-tag">DATOS DEL EQUIPO:</div><div class="fsis-equipment-data"><div class="fsis-static-textarea">${esc(values.equipmentDetails || '—').replace(/\r?\n/g, '<br>')}</div></div></section><section class="fsis-activities"><div class="fsis-section-tag">ACTIVIDADES REALIZADAS</div><table class="fsis-table"><thead><tr><th></th><th>REALIZADAS</th><th>NO REALIZADAS</th><th>NO APLICA</th></tr></thead><tbody>${activityRow('LIMPIEZA EXTERIOR', values.cleaningExterior)}${activityRow('LIMPIEZA INTERIOR', values.cleaningInterior)}${activityRow('DEPURACIÓN DE SISTEMA', values.systemCleanup)}${activityRow('REVISIÓN DE VIRUS', values.virusReview)}</tbody></table><div class="fsis-password"><strong>CONTRASEÑA DE COMPUTADORA</strong>${staticValue(values.computerPassword)}</div></section><section class="fsis-survey"><div class="fsis-section-tag">ENCUESTA DE SATISFACCIÓN</div><p>Favor de Responder de 6 a 10 de acuerdo a la Satisfacción del Servicio, siendo 6 Pésimo, 7 Puede Mejorar, 8 Bueno, 9 Superó mis Expectativas y 10 Excelente.</p><div class="fsis-satisfaction-row"><strong>SATISFACCIÓN DEL MANTENIMIENTO REALIZADO</strong><div class="fsis-rating fsis-rating-static"><span>${esc(values.satisfaction || '—')}</span></div></div></section><section class="fsis-comments"><div class="fsis-section-tag">COMENTARIOS O SUGERENCIAS</div><div class="fsis-static-comments">${esc(values.comments || '—').replace(/\r?\n/g,'<br>')}</div></section><section class="fsis-signatures">${signatureBlock(selectedPerson, receipt.signature, 'NOMBRE DEL USUARIO')}${signatureBlock(receipt.performedByName, receipt.performedBySignature, 'REALIZADO POR')}</section><footer class="fsis-footer">F-SIS-01 Rev.04</footer></article></article>`;
+        return `<article class="receipt digital-form-receipt"><article class="fsis01-sheet fsis01-receipt" aria-label="F-SIS-01 Rev. 04 Orden de Servicio"><header class="fsis01-header"><img class="fsis01-letterhead" src="assets/fsis01-header.jpg" alt="Encabezado institucional Grupo RAME"><div class="fsis01-title">ORDEN DE SERVICIO</div></header><section class="fsis-meta">${metaField('FECHA', values.date)}${metaField('DEPARTAMENTO', values.department)}</section><section class="fsis-equipment"><div class="fsis-section-tag">DATOS DEL EQUIPO:</div><div class="fsis-equipment-data"><div class="fsis-static-textarea">${esc(values.equipmentDetails || '—').replace(/\r?\n/g, '<br>')}</div></div></section><section class="fsis-activities"><div class="fsis-section-tag">ACTIVIDADES REALIZADAS</div><table class="fsis-table"><thead><tr><th></th><th>REALIZADAS</th><th>NO REALIZADAS</th><th>NO APLICA</th></tr></thead><tbody>${activityRow('LIMPIEZA EXTERIOR', values.cleaningExterior)}${activityRow('LIMPIEZA INTERIOR', values.cleaningInterior)}${activityRow('DEPURACIÓN DE SISTEMA', values.systemCleanup)}${activityRow('REVISIÓN DE VIRUS', values.virusReview)}</tbody></table><div class="fsis-password"><strong>CONTRASEÑA DE COMPUTADORA</strong>${staticValue(values.computerPassword)}</div></section><section class="fsis-survey"><div class="fsis-section-tag">ENCUESTA DE SATISFACCIÓN</div><p>Favor de Responder de 6 a 10 de acuerdo a la Satisfacción del Servicio, siendo 6 Pésimo, 7 Puede Mejorar, 8 Bueno, 9 Superó mis Expectativas y 10 Excelente.</p><div class="fsis-satisfaction-row"><strong>SATISFACCIÓN DEL MANTENIMIENTO REALIZADO</strong><div class="fsis-rating fsis-rating-static"><span>${esc(values.satisfaction || '—')}</span></div></div></section><section class="fsis-comments"><div class="fsis-section-tag">COMENTARIOS O SUGERENCIAS</div><div class="fsis-static-comments">${esc(values.comments || '—').replace(/\r?\n/g,'<br>')}</div></section><section class="fsis-signatures">${signatureBlock(selectedPerson, receipt.signature, 'NOMBRE DEL USUARIO')}${signatureBlock(receipt.performedByName, receipt.performedBySignature, 'REALIZADO POR')}</section><footer class="fsis-footer">F-SIS-01 Rev.04</footer></article></article>`;
     }
-    const activityField = (label, value) => `<div class="sheet-print-field"><strong>${label}</strong><span>${esc(value || '—')}</span></div>`;
-    const satisfaction = `<div class="sheet-satisfaction sheet-print-satisfaction">${[6, 7, 8, 9, 10].map(score => `<span class="${Number(values.satisfaction) === score ? 'selected' : ''}">${score}</span>`).join('')}</div>`;
-    const signatures = `<div class="sheet-signatures sheet-print-signatures"><div><strong>NOMBRE DEL USUARIO: ${esc(receipt.signedName)}</strong><img class="sheet-signature-image" src="${receipt.signature}" alt="Firma de ${esc(receipt.signedName)}"><label>FIRMA DEL USUARIO</label></div><div><strong>REALIZADO POR: ${esc(receipt.performedByName)}</strong><img class="sheet-signature-image" src="${receipt.performedBySignature}" alt="Firma de ${esc(receipt.performedByName)}"><label>FIRMA</label></div></div>`;
-    return `<article class="receipt digital-form-receipt"><article class="word-sheet word-sheet-corrective"><header class="sheet-header"><span>F-SIS-02 · REV. 03</span><h2>Solicitud de Mantenimiento Correctivo a Equipo de Software y Hardware</h2></header><div class="sheet-grid sheet-meta">${activityField('FECHA', values.date)}${activityField('FECHA DE CIERRE', values.closingDate)}</div>${activityField('DATOS DEL EQUIPO', values.equipmentDetails)}<section class="sheet-section">${activityField('FALLA QUE PRESENTA', values.failure)}${activityField('DIAGNÓSTICO', values.diagnosis)}${activityField('ACTIVIDADES REALIZADAS', values.activities)}</section><section class="sheet-section"><h3>ENCUESTA DE SATISFACCIÓN</h3><p>Favor de responder de 6 a 10 de acuerdo con la satisfacción del servicio.</p>${satisfaction}${activityField('TIEMPO DE RESPUESTA', values.responseTime)}${activityField('SOLUCIÓN QUE SE LE DIO', values.solution)}${activityField('COMENTARIOS O SUGERENCIAS', values.comments)}</section>${signatures}</article></article>`;
+    const corrBlockStatic = (label, value) => `<section class="fsis-comments"><div class="fsis-section-tag">${label}</div><div class="fsis-static-comments">${esc(value || '—').replace(/\r?\n/g, '<br>')}</div></section>`;
+    return `<article class="receipt digital-form-receipt"><article class="fsis01-sheet fsis01-receipt fsis02-sheet" aria-label="F-SIS-02 Rev. 03 Solicitud de Mantenimiento Correctivo"><header class="fsis01-header"><img class="fsis01-letterhead" src="assets/fsis01-header.jpg" alt="Encabezado institucional Grupo RAME"><div class="fsis01-title">SOLICITUD DE MANTENIMIENTO CORRECTIVO A EQUIPO DE SOFTWARE Y HARDWARE</div></header><section class="fsis-meta fsis-meta-corrective">${metaField('FECHA', values.date)}${metaField('FECHA DE CIERRE', values.closingDate)}<div class="fsis-meta-wide">${metaField('DEPARTAMENTO', values.department)}</div></section><section class="fsis-equipment"><div class="fsis-section-tag">DATOS DEL EQUIPO:</div><div class="fsis-equipment-data"><div class="fsis-static-textarea">${esc(values.equipmentDetails || '—').replace(/\r?\n/g, '<br>')}</div></div></section><div class="fsis-stack">${corrBlockStatic('FALLA QUE PRESENTA', values.failure)}${corrBlockStatic('DIAGNÓSTICO', values.diagnosis)}${corrBlockStatic('ACTIVIDADES REALIZADAS', values.activities)}</div><section class="fsis-survey fsis-survey-corrective"><div class="fsis-section-tag">ENCUESTA DE SATISFACCIÓN</div><p>Favor de Responder de 6 a 10 de acuerdo a la Satisfacción del Servicio, siendo 6 Pésimo, 7 Puede Mejorar, 8 Bueno, 9 Superó mis Expectativas y 10 Excelente.</p><div class="fsis-satisfaction-row"><strong>SATISFACCIÓN DEL SERVICIO</strong><div class="fsis-rating fsis-rating-static"><span>${esc(values.satisfaction || '—')}</span></div></div></section><div class="fsis-stack fsis-stack-after">${corrBlockStatic('TIEMPO DE RESPUESTA', values.responseTime)}${corrBlockStatic('SOLUCIÓN QUE SE LE DIO', values.solution)}${corrBlockStatic('COMENTARIOS O SUGERENCIAS', values.comments)}</div><section class="fsis-signatures">${signatureBlock(selectedPerson, receipt.signature, 'NOMBRE DEL USUARIO')}${signatureBlock(receipt.performedByName, receipt.performedBySignature, 'REALIZADO POR')}</section><footer class="fsis-footer">F-SIS-02 Rev.03</footer></article></article>`;
 }
 
 start();

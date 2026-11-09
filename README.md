@@ -7,6 +7,7 @@ Plataforma interna para inventario de PC y laptops, usuarios, credenciales, cart
 - XAMPP con PHP 8.1 o posterior, Apache y MySQL/MariaDB.
 - Extensiones PHP `pdo_mysql`, `openssl` y `mbstring` habilitadas.
 - Composer para habilitar el envío SMTP con PHPMailer.
+- Composer para habilitar el envío SMTP con PHPMailer.
 
 ## Instalación en XAMPP
 
@@ -22,8 +23,8 @@ Plataforma interna para inventario de PC y laptops, usuarios, credenciales, cart
 
    Pega el resultado en `encryption_key` dentro de `app/config.local.php`. No pierdas esta clave: las contraseñas y secretos cifrados no se podrán recuperar sin ella. Guarda una copia protegida por separado de la base de datos.
 5. Ajusta host, usuario y contraseña MySQL en el mismo archivo si tu instalación no usa `root` sin contraseña.
-6. Desde la carpeta del proyecto instala PHPMailer ejecutando `composer install`.
-7. Completa los valores SMTP (`host`, `port`, `username`, `password`, `from_email`, `encryption`) en `app/config.local.php`. Sin SMTP configurado, el sistema agenda el mantenimiento, avisa que el correo no se envió y permite copiar un enlace seguro para compartirlo manualmente.
+6. Desde la carpeta del proyecto ejecuta `composer install` para habilitar PHPMailer.
+7. Completa los valores SMTP (`host`, `port`, `username`, `password`, `from_email`, `encryption`) en `app/config.local.php`. Si SMTP falla, el sistema permite copiar una invitación con enlace seguro para compartirla manualmente.
 8. Abre `http://localhost/Rame/` y crea la primera cuenta administradora. Usa una contraseña de al menos 8 caracteres.
 9. Desde **Usuarios**, agrega cuentas de técnicos y usuarios finales. Registra los activos antes de asignarlos; las cartas escaneadas se gestionan desde las acciones de cada computadora o celular.
 10. Para importar `acomodo.xlsx`, ejecuta `database\import_acomodo.ps1` en PowerShell para simular y revisar los conteos. Ejecuta `database\import_acomodo.ps1 -Apply` para aplicar la carga. El importador copia las contraseñas de Windows a la ficha de cada activo; se guardan sin cifrar en la columna `windows_password`. Las claves ESET se cifran y las asignaciones sin equipo encontrado quedan pendientes.
@@ -32,13 +33,13 @@ Plataforma interna para inventario de PC y laptops, usuarios, credenciales, cart
 
 - Panel de operación con activos y próximos mantenimientos.
 - Gráficas del inventario por estado y tipo, licencias por vigencia y tendencia mensual de mantenimientos.
-- Inventario de PC y laptops con hasta cinco responsables por equipo. Cada responsable tiene su propia carta; necesita una cuenta con correo solo si debe iniciar sesión en la plataforma.
+- Inventario de PC y laptops con hasta cinco responsables por equipo. Cada responsable tiene su propia carta; se asigna por nombre de persona.
 - Las licencias por vencer se calculan usando su fecha de vencimiento. Las asignaciones importadas no se consideran capacidad contratada hasta que se confirme en el módulo de licencias.
 - Ficha de equipo con usuario y contraseña de Windows/RDP, asignación, departamento, puesto, garantía, terminal, monitor, mouse y host RDP. La contraseña de equipo se guarda sin cifrar en la base de datos y solo administración puede revelarla; restringe el acceso a MySQL y protege los respaldos. Las credenciales de la bóveda y las claves de licencia siguen cifradas con AES-256-GCM.
 - Estado del celular: **Activo**, **Formateado** o **Por formatear**, separado de su estado general de inventario.
 - Inventario separado entre equipos de cómputo y celulares administrativos/operacionales, con historial cronológico de fallas, piezas y reparaciones por equipo.
 - Bóveda de credenciales cifradas con AES-256-GCM; solo administración puede revelarlas.
-- Agenda de mantenimiento con enlace individual para confirmar o proponer otro horario.
+- Agenda de mantenimiento por equipo con enlace seguro para confirmar o proponer otro horario.
 - Meta anual de dos mantenimientos preventivos completados por equipo. El avance se calcula por año calendario desde el historial real; pendientes, programados y cancelados no cuentan.
 - Agenda visual mensual con vistas semanal y diaria. Las reservas usan intervalos de 30 minutos entre 8:30 a. m. y 5:00 p. m., con unicidad en MySQL para evitar dobles reservas simultáneas.
 - El personal autorizado puede reprogramar o cancelar servicios. La reprogramación registra la fecha anterior y la nueva en el historial del activo y libera el horario anterior.

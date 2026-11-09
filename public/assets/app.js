@@ -1351,20 +1351,7 @@ function openCreateForm(route, record = null, documentFormType = 'service_order'
             const result = await api(action, { method: 'POST', body: formData });
             closeModal();
             if (route === 'maintenance') {
-                const emailMessage = result.emailMessage || 'No se confirmó el envío por correo.';
-                showModal('Invitación de mantenimiento', `<div class="notice ${result.emailSent ? '' : 'error'}"><span>${result.emailSent ? '✓' : '!'}</span><div>${escapeHtml(emailMessage)}</div></div><div class="field full"><label for="manual-maintenance-invitation">Invitación para compartir manualmente</label><textarea id="manual-maintenance-invitation" rows="7" readonly>${escapeHtml(result.manualInvitation || '')}</textarea></div><div class="form-actions"><button type="button" class="secondary-button" id="copy-maintenance-invitation">Copiar invitación</button><button type="button" class="primary-button" data-close>Listo</button></div>`);
-                document.querySelector('#copy-maintenance-invitation')?.addEventListener('click', async () => {
-                    const invitation = document.querySelector('#manual-maintenance-invitation');
-                    try {
-                        if (!navigator.clipboard?.writeText) throw new Error('Portapapeles no disponible');
-                        await navigator.clipboard.writeText(invitation.value);
-                        toast('Invitación copiada al portapapeles.');
-                    } catch (error) {
-                        invitation.focus();
-                        invitation.select();
-                        toast('No se pudo copiar automáticamente. Selecciona y copia el texto.');
-                    }
-                });
+                toast(result.message || 'Servicio guardado en la agenda.');
             }
             else toast(maintenanceRecord ? 'Orden de Servicio firmada y guardada; mantenimiento cerrado.' : route === 'documents' ? 'Formato guardado con las dos firmas.' : 'Registro guardado.');
             await renderApp();

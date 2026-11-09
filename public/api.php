@@ -104,59 +104,6 @@ function department_plan_period(int $year, int $month): array
     return [$start, $start->modify('first day of next month')];
 }
 
-function send_maintenance_invitation_email(string $recipientEmail, string $recipientName, array $asset, string $scheduledAt, string $inviteUrl): array
-{
-    global $config;
-    $smtp = $config['smtp'] ?? [];
-    $username = trim((string) ($smtp['username'] ?? ''));
-    if (empty($smtp['host']) || empty($smtp['from_email']) || ($username !== '' && empty($smtp['password']))) {
-        return ['sent' => false, 'message' => 'No se envió el correo: falta completar la configuración SMTP.'];
-    }
-
-    $autoload = __DIR__ . '/../vendor/autoload.php';
-    if (!is_file($autoload)) {
-        return ['sent' => false, 'message' => 'No se envió el correo: PHPMailer no está disponible.'];
-    }
-    require_once $autoload;
-    $mailerClass = 'PHPMailer\\PHPMailer\\PHPMailer';
-    if (!class_exists($mailerClass)) {
-        return ['sent' => false, 'message' => 'No se envió el correo: PHPMailer no está disponible.'];
-    }
-
-    $date = (new DateTimeImmutable($scheduledAt))->format('d/m/Y H:i');
-    $assetLabel = trim((string) $asset['asset_tag'] . ' · ' . (string) $asset['brand'] . ' ' . (string) $asset['model']);
-    try {
-        $mail = new $mailerClass(true);
-        $mail->isSMTP();
-        $mail->Host = (string) $smtp['host'];
-        $mail->Port = (int) ($smtp['port'] ?? 587);
-        $mail->SMTPAuth = $username !== '';
-        $mail->Username = $username;
-        $mail->Password = (string) ($smtp['password'] ?? '');
-        if (($smtp['encryption'] ?? '') === 'tls') {
-            $mail->SMTPSecure = constant($mailerClass . '::ENCRYPTION_STARTTLS');
-        } elseif (($smtp['encryption'] ?? '') === 'ssl') {
-            $mail->SMTPSecure = constant($mailerClass . '::ENCRYPTION_SMTPS');
-        }
-        $mail->CharSet = 'UTF-8';
-        $mail->setFrom((string) $smtp['from_email'], (string) ($smtp['from_name'] ?? 'Rame TI'));
-        $mail->addAddress($recipientEmail, $recipientName);
-        $mail->isHTML(true);
-        $mail->Subject = 'Agenda tu mantenimiento preventivo';
-        $mail->Body = '<p>Hola ' . htmlspecialchars($recipientName, ENT_QUOTES, 'UTF-8') . ',</p>'
-            . '<p>Se programó el mantenimiento de <strong>' . htmlspecialchars($assetLabel, ENT_QUOTES, 'UTF-8') . '</strong> para el ' . $date . '.</p>'
-            . '<p><a href="' . htmlspecialchars($inviteUrl, ENT_QUOTES, 'UTF-8') . '">Confirma el horario o propone otro</a></p>';
-        $mail->AltBody = "Hola {$recipientName}, se programó el mantenimiento de {$assetLabel} para el {$date}. Confirma el horario o propone otro: {$inviteUrl}";
-        if (!$mail->send()) {
-            return ['sent' => false, 'message' => 'PHPMailer no confirmó el envío. Comparte la invitación manualmente.'];
-        }
-        return ['sent' => true, 'message' => 'PHPMailer confirmó el envío del correo.'];
-    } catch (Throwable $error) {
-        error_log('[Rame mail] SMTP send failed.');
-        return ['sent' => false, 'message' => 'PHPMailer no confirmó el envío. Comparte la invitación manualmente.'];
-    }
-}
-
 try {
     if ($action === 'state' && $method === 'GET') {
         $userCount = (int) db()->query('SELECT COUNT(*) FROM users')->fetchColumn();
@@ -206,93 +153,6 @@ try {
         require_user();
         $_SESSION = [];
         session_destroy();
-        json_response(['ok' => true]);
-    }
-
-    if ($action === 'invite' && $method === 'GET') {
-        $token = strtolower(trim((string) ($_GET['token'] ?? '')));
-        if (!preg_match('/\A[a-f0-9]{64}\z/', $token)) {
-            json_response(['error' => 'El enlace no existe o ya no es válido.'], 404);
-        }
-        $statement = db()->prepare('SELECT m.id, m.scheduled_at, m.proposed_at, m.status, m.notes, a.asset_tag, a.brand, a.model, u.name AS user_name FROM maintenance m JOIN assets a ON a.id=m.asset_id JOIN users u ON u.id=m.user_id WHERE m.invite_token_hash=? LIMIT 1');
-        $statement->execute([hash('sha256', $token)]);
-        $invite = $statement->fetch();
-        if (!$invite) {
-            json_response(['error' => 'El enlace no existe o ya no es válido.'], 404);
-        }
-        $saved = json_decode((string) ($invite['notes'] ?? ''), true);
-        if (is_array($saved) && ($saved['_rame_service'] ?? false) === true) {
-            $invite['user_name'] = (string) ($saved['person_name'] ?? $invite['user_name']);
-            $invite['notes'] = (string) ($saved['service_notes'] ?? '');
-        }
-        json_response(['invite' => $invite]);
-    }
-
-    if ($action === 'invite-availability' && $method === 'GET') {
-        $token = strtolower(trim((string) ($_GET['token'] ?? '')));
-        $dateValue = trim((string) ($_GET['date'] ?? ''));
-        if (!preg_match('/\A[a-f0-9]{64}\z/', $token)) {
-            json_response(['error' => 'Esta invitación ya no está disponible.'], 404);
-        }
-        $date = DateTimeImmutable::createFromFormat('!Y-m-d', $dateValue);
-        $errors = DateTimeImmutable::getLastErrors();
-        if (!$date || ($errors !== false && ($errors['warning_count'] || $errors['error_count'])) || $date->format('Y-m-d') !== $dateValue) {
-            json_response(['error' => 'Selecciona una fecha válida.'], 422);
-        }
-        $inviteQuery = db()->prepare('SELECT id, status FROM maintenance WHERE invite_token_hash=? LIMIT 1');
-        $inviteQuery->execute([hash('sha256', $token)]);
-        $invite = $inviteQuery->fetch();
-        if (!$invite || in_array($invite['status'], ['completed', 'cancelled'], true)) {
-            json_response(['error' => 'Esta invitación ya no está disponible.'], 404);
-        }
-        $busyQuery = db()->prepare('SELECT DATE_FORMAT(reserved_slot, "%H:%i") FROM maintenance WHERE reserved_slot>=? AND reserved_slot<? AND id<>?');
-        $busyQuery->execute([$date->format('Y-m-d 00:00:00'), $date->modify('+1 day')->format('Y-m-d 00:00:00'), $invite['id']]);
-        $busy = array_fill_keys(array_column($busyQuery->fetchAll(PDO::FETCH_NUM), 0), true);
-        $slots = [];
-        for ($minute = 510; $minute < 1020; $minute += 30) {
-            $time = sprintf('%02d:%02d', intdiv($minute, 60), $minute % 60);
-            $slotDate = DateTimeImmutable::createFromFormat('!Y-m-d H:i', $dateValue . ' ' . $time);
-            $slots[] = ['time' => $time, 'available' => !isset($busy[$time]) && $slotDate && $slotDate->getTimestamp() > time()];
-        }
-        json_response(['date' => $dateValue, 'slots' => $slots]);
-    }
-
-    if ($action === 'invite-response' && $method === 'POST') {
-        $token = strtolower(trim((string) ($data['token'] ?? '')));
-        $choice = $data['choice'] ?? '';
-        $proposedAt = $data['proposedAt'] ?? null;
-        if (!preg_match('/\A[a-f0-9]{64}\z/', $token)) {
-            json_response(['error' => 'Esta invitación ya no está disponible.'], 404);
-        }
-        $proposedDate = $choice === 'reschedule' && is_string($proposedAt) ? parse_maintenance_slot($proposedAt) : null;
-        if ($choice !== 'confirm' && ($choice !== 'reschedule' || !$proposedDate)) {
-            json_response(['error' => 'Selecciona una opción y una fecha futura válida.'], 422);
-        }
-        db()->beginTransaction();
-        try {
-            $inviteQuery = db()->prepare('SELECT id, status FROM maintenance WHERE invite_token_hash=? FOR UPDATE');
-            $inviteQuery->execute([hash('sha256', $token)]);
-            $invite = $inviteQuery->fetch();
-            if (!$invite || in_array($invite['status'], ['completed', 'cancelled'], true)) {
-                db()->rollBack();
-                json_response(['error' => 'Esta invitación ya no está disponible.'], 409);
-            }
-            if ($choice === 'confirm') {
-                db()->prepare('UPDATE maintenance SET status="confirmed", proposed_at=NULL WHERE id=?')->execute([$invite['id']]);
-            } else {
-                db()->prepare('UPDATE maintenance SET status="reschedule_requested", proposed_at=? WHERE id=?')
-                    ->execute([$proposedDate->format('Y-m-d H:i:s'), $invite['id']]);
-            }
-            db()->commit();
-        } catch (Throwable $error) {
-            if (db()->inTransaction()) {
-                db()->rollBack();
-            }
-            if (is_duplicate_slot_error($error)) {
-                json_response(['error' => 'Ese horario acaba de ocuparse. Elige otro horario disponible.'], 409);
-            }
-            throw $error;
-        }
         json_response(['ok' => true]);
     }
 
@@ -1155,7 +1015,7 @@ try {
         if ($personName === '') {
             json_response(['error' => 'Selecciona una persona asignada al equipo.'], 422);
         }
-        $assetQuery = db()->prepare('SELECT id, asset_tag, brand, model, source_assignee_name FROM assets WHERE id=? AND type="computer" AND status<>"retired"');
+        $assetQuery = db()->prepare('SELECT id, source_assignee_name FROM assets WHERE id=? AND type="computer" AND status<>"retired"');
         $assetQuery->execute([$assetId]);
         $asset = $assetQuery->fetch();
         if (!$asset) {
@@ -1195,7 +1055,6 @@ try {
             'person_name' => $personName,
             'service_notes' => $serviceNotes,
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        $token = bin2hex(random_bytes(32));
         db()->beginTransaction();
         try {
             $assetLock = db()->prepare('SELECT id FROM assets WHERE id=? FOR UPDATE');
@@ -1204,8 +1063,8 @@ try {
                 db()->rollBack();
                 json_response(['error' => 'No se encontró el equipo seleccionado.'], 404);
             }
-            $stmt = db()->prepare('INSERT INTO maintenance (asset_id, user_id, technician_id, scheduled_at, status, invite_token_hash, notes) VALUES (?, ?, ?, ?, "pending", ?, ?)');
-            $stmt->execute([$assetId, $user['id'], $user['id'], $scheduledAt, hash('sha256', $token), $savedNotes]);
+            $stmt = db()->prepare('INSERT INTO maintenance (asset_id, user_id, technician_id, scheduled_at, status, notes) VALUES (?, ?, ?, ?, "confirmed", ?)');
+            $stmt->execute([$assetId, $user['id'], $user['id'], $scheduledAt, $savedNotes]);
             db()->commit();
         } catch (Throwable $error) {
             if (db()->inTransaction()) {
@@ -1215,39 +1074,7 @@ try {
             throw $error;
         }
 
-        $recipientQuery = db()->prepare('SELECT DISTINCT u.name, u.email FROM users u WHERE u.id IN (SELECT user_id FROM asset_users WHERE asset_id=? UNION SELECT assigned_user_id FROM assets WHERE id=? AND assigned_user_id IS NOT NULL)');
-        $recipientQuery->execute([$assetId, $assetId]);
-        $recipientEmails = [];
-        foreach ($recipientQuery->fetchAll() as $candidate) {
-            if (normalize_person_key((string) $candidate['name']) === normalize_person_key($personName)) {
-                $email = filter_var($candidate['email'], FILTER_VALIDATE_EMAIL);
-                if ($email) $recipientEmails[(string) $email] = ['email' => (string) $email, 'name' => (string) $candidate['name']];
-            }
-        }
-
-        $inviteUrl = rtrim((string) $config['app_url'], '/') . '/respond.php?token=' . rawurlencode($token);
-        $date = (new DateTimeImmutable($scheduledAt))->format('d/m/Y H:i');
-        $assetLabel = trim((string) $asset['asset_tag'] . ' · ' . (string) $asset['brand'] . ' ' . (string) $asset['model']);
-        $manualInvitation = "Hola {$personName}:\nSe programó el mantenimiento de {$assetLabel} para el {$date}.\nConfirma el horario o propone otro desde este enlace:\n{$inviteUrl}";
-        if (count($recipientEmails) === 1) {
-            $recipient = reset($recipientEmails);
-            $emailResult = send_maintenance_invitation_email($recipient['email'], $recipient['name'], $asset, $scheduledAt, $inviteUrl);
-        } else {
-            $message = $recipientEmails
-                ? 'No se envió el correo: hay más de una cuenta coincidente. Comparte la invitación manualmente.'
-                : 'No se envió el correo: la persona no tiene un correo asociado en Activos. Comparte la invitación manualmente.';
-            $emailResult = ['sent' => false, 'message' => $message];
-        }
-        if ($emailResult['sent']) {
-            db()->prepare('UPDATE maintenance SET invitation_sent_at=NOW() WHERE invite_token_hash=?')->execute([hash('sha256', $token)]);
-        }
-        json_response([
-            'ok' => true,
-            'message' => $emailResult['sent'] ? 'Invitación enviada por correo.' : 'Servicio agendado; comparte la invitación manualmente.',
-            'emailSent' => $emailResult['sent'],
-            'emailMessage' => $emailResult['message'],
-            'manualInvitation' => $manualInvitation,
-        ]);
+        json_response(['ok' => true, 'message' => 'Servicio guardado en la agenda.']);
     }
 
     if ($action === 'maintenance-reschedule' && $method === 'POST') {

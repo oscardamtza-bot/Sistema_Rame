@@ -6,8 +6,6 @@ Plataforma interna para inventario de PC y laptops, usuarios, credenciales, cart
 
 - XAMPP con PHP 8.1 o posterior, Apache y MySQL/MariaDB.
 - Extensiones PHP `pdo_mysql`, `openssl` y `mbstring` habilitadas.
-- Composer para habilitar el envío SMTP con PHPMailer.
-- Composer para habilitar el envío SMTP con PHPMailer.
 
 ## Instalación en XAMPP
 
@@ -23,11 +21,9 @@ Plataforma interna para inventario de PC y laptops, usuarios, credenciales, cart
 
    Pega el resultado en `encryption_key` dentro de `app/config.local.php`. No pierdas esta clave: las contraseñas y secretos cifrados no se podrán recuperar sin ella. Guarda una copia protegida por separado de la base de datos.
 5. Ajusta host, usuario y contraseña MySQL en el mismo archivo si tu instalación no usa `root` sin contraseña.
-6. Desde la carpeta del proyecto ejecuta `composer install` para habilitar PHPMailer.
-7. Completa los valores SMTP (`host`, `port`, `username`, `password`, `from_email`, `encryption`) en `app/config.local.php`. Si SMTP falla, el sistema permite copiar una invitación con enlace seguro para compartirla manualmente.
-8. Abre `http://localhost/Rame/` y crea la primera cuenta administradora. Usa una contraseña de al menos 8 caracteres.
-9. Desde **Usuarios**, agrega cuentas de técnicos y usuarios finales. Registra los activos antes de asignarlos; las cartas escaneadas se gestionan desde las acciones de cada computadora o celular.
-10. Para importar `acomodo.xlsx`, ejecuta `database\import_acomodo.ps1` en PowerShell para simular y revisar los conteos. Ejecuta `database\import_acomodo.ps1 -Apply` para aplicar la carga. El importador copia las contraseñas de Windows a la ficha de cada activo; se guardan sin cifrar en la columna `windows_password`. Las claves ESET se cifran y las asignaciones sin equipo encontrado quedan pendientes.
+6. Abre `http://localhost/Rame/` y crea la primera cuenta administradora. Usa una contraseña de al menos 8 caracteres.
+7. Desde **Usuarios**, agrega cuentas de técnicos y usuarios finales. Registra los activos antes de asignarlos; las cartas escaneadas se gestionan desde las acciones de cada computadora o celular.
+8. Para importar `acomodo.xlsx`, ejecuta `database\import_acomodo.ps1` en PowerShell para simular y revisar los conteos. Ejecuta `database\import_acomodo.ps1 -Apply` para aplicar la carga. El importador copia las contraseñas de Windows a la ficha de cada activo; se guardan sin cifrar en la columna `windows_password`. Las claves ESET se cifran y las asignaciones sin equipo encontrado quedan pendientes.
 
 ## Funciones incluidas
 
@@ -39,7 +35,7 @@ Plataforma interna para inventario de PC y laptops, usuarios, credenciales, cart
 - Estado del celular: **Activo**, **Formateado** o **Por formatear**, separado de su estado general de inventario.
 - Inventario separado entre equipos de cómputo y celulares administrativos/operacionales, con historial cronológico de fallas, piezas y reparaciones por equipo.
 - Bóveda de credenciales cifradas con AES-256-GCM; solo administración puede revelarlas.
-- Agenda de mantenimiento por equipo con enlace seguro para confirmar o proponer otro horario.
+- Agenda de mantenimiento por equipo.
 - Meta anual de dos mantenimientos preventivos completados por equipo. El avance se calcula por año calendario desde el historial real; pendientes, programados y cancelados no cuentan.
 - Agenda visual mensual con vistas semanal y diaria. Las reservas usan intervalos de 30 minutos entre 8:30 a. m. y 5:00 p. m., con unicidad en MySQL para evitar dobles reservas simultáneas.
 - El personal autorizado puede reprogramar o cancelar servicios. La reprogramación registra la fecha anterior y la nueva en el historial del activo y libera el horario anterior.
@@ -49,7 +45,6 @@ Plataforma interna para inventario de PC y laptops, usuarios, credenciales, cart
 - Formatos digitales F-SIS-01 Orden de Servicio y F-SIS-02 Solicitud de Mantenimiento Correctivo, con captura estructurada e impresión/guardado como PDF.
 - Los formatos de servicio registran las firmas del usuario y de quien realizó el trabajo, junto con fecha e IP; las cartas responsivas digitales anteriores siguen disponibles.
 - Cartas responsivas escaneadas en PDF, JPG o PNG disponibles únicamente desde los activos de computadoras y celulares; cada carta se vincula a una persona y a su equipo compartido.
-- Invitaciones tokenizadas; solo se almacena el hash del token en la base de datos.
 
 ## Roles
 
